@@ -28,6 +28,10 @@ name: Cupos UASD
 on:
   schedule:
     - cron: '7,37 * * * *'
+  # Cada cambio del scraper se comprueba con el diagnóstico (no escribe nada).
+  push:
+    branches: [main]
+    paths: ['cupos/**', '.github/workflows/cupos-uasd.yml']
   workflow_dispatch:
     inputs:
       modo:
@@ -43,7 +47,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cupos-uasd
+  group: ${{ github.event_name == 'push' && 'cupos-uasd-diagnostico' || 'cupos-uasd' }}
   cancel-in-progress: false
 
 jobs:
@@ -97,6 +101,7 @@ jobs:
           HAY_CLAVE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' }}
         run: |
           modo="$MODO"
+          [ "$GITHUB_EVENT_NAME" = "push" ] && modo=diagnostico
           if [ "$HAY_URL" != "true" ] || [ "$HAY_CLAVE" != "true" ]; then
             if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
               echo "::notice::Faltan los secretos de Supabase: el horario no hace nada hasta que se agreguen."
