@@ -1242,8 +1242,15 @@ async function main() {
   // Si encuentra uno que pase Cloudflare, la salida ya NO es la IP bloqueada de
   // la casa → nos saltamos el enfriamiento y atacamos con el proxy.
   if (TRY_PROXY && !activeProxy) {
-    const found = await huntWorkingProxy(Number(process.env.PROXY_HUNT_MIN || 6));
-    if (found) { activeProxy = found; console.log(`   → Usando proxy gratis: ${activeProxy}`); }
+    // (2026-11-10, Runner) Primero la salida DIRECTA: medido en GitHub Actions, la IP del
+    // runner pasa Cloudflare y es más rápida y fiable que cualquier proxy gratis. El proxy
+    // solo entra si la directa queda bloqueada.
+    if (await testProxy(null, 25_000)) {
+      console.log('   ✓ La salida directa pasa Cloudflare: sin proxy en este ciclo.');
+    } else {
+      const found = await huntWorkingProxy(Number(process.env.PROXY_HUNT_MIN || 6));
+      if (found) { activeProxy = found; console.log(`   → Usando proxy gratis: ${activeProxy}`); }
+    }
   }
 
   // ── Enfriamiento anti-bloqueo IP-AWARE (ANTES de tocar la UASD) ───────────
