@@ -49,7 +49,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ${{ github.event_name == 'push' && 'cupos-uasd-diagnostico' || 'cupos-uasd' }}
+  group: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[turno]') && 'cupos-uasd-diagnostico' || 'cupos-uasd' }}
   cancel-in-progress: false
 
 jobs:
@@ -103,9 +103,13 @@ jobs:
           MODO: ${{ github.event.inputs.modo || 'turno' }}
           HAY_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL != '' }}
           HAY_CLAVE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' }}
+          TURNO_POR_PUSH: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]') }}
         run: |
           modo="$MODO"
-          [ "$GITHUB_EVENT_NAME" = "push" ] && modo=diagnostico
+          # Un push es diagnóstico, salvo que su mensaje lleve [turno] (arranque inmediato).
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            if [ "$TURNO_POR_PUSH" = "true" ]; then modo=turno; else modo=diagnostico; fi
+          fi
           # Sin secretos se escribe por el puente OIDC (lo normal en este repo público).
           [ "$HAY_URL" != "true" ] || [ "$HAY_CLAVE" != "true" ] && echo "Escritura por el puente OIDC (sin claves en el repo)."
           true
