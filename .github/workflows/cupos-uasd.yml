@@ -17,10 +17,9 @@
 #     turnos (caché); si la salida directa está bloqueada, el ETL busca un proxy
 #     público que pase (ver cupos/proxies.mjs).
 #
-# Secretos (Settings → Secrets and variables → Actions):
-#   NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   (obligatorios)
-#   PROXY_SCRAPER_KEY                                     (opcional, clave gratis de api.proxyscraper.com)
-# Sin los obligatorios, el turno solo corre el DIAGNÓSTICO (no escribe nada).
+# Claves: NINGUNA. El turno se identifica con el token OIDC que GitHub firma para cada
+# ejecución y la función `etl-puente` de Supabase (que verifica repo, rama y workflow)
+# escribe con la clave que vive allí. Opcional: secreto PROXY_SCRAPER_KEY.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Cupos UASD
@@ -45,6 +44,9 @@ on:
 
 permissions:
   contents: read
+  # Token de identidad firmado por GitHub para el puente `etl-puente` de Supabase:
+  # así este repo público no guarda ninguna clave.
+  id-token: write
 
 concurrency:
   group: ${{ github.event_name == 'push' && 'cupos-uasd-diagnostico' || 'cupos-uasd' }}
@@ -64,6 +66,8 @@ jobs:
       PROXY_SCRAPER_KEY: ${{ secrets.PROXY_SCRAPER_KEY }}
       ESTADO: ${{ github.workspace }}/.estado
       HEADLESS: 'false'
+      # Puente sin claves (función de Supabase que verifica el token OIDC de este workflow).
+      ETL_PUENTE: https://gntczowattweopbrasxs.supabase.co/functions/v1/etl-puente
     steps:
       - uses: actions/checkout@v4
 
@@ -102,15 +106,9 @@ jobs:
         run: |
           modo="$MODO"
           [ "$GITHUB_EVENT_NAME" = "push" ] && modo=diagnostico
-          if [ "$HAY_URL" != "true" ] || [ "$HAY_CLAVE" != "true" ]; then
-            if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-              echo "::notice::Faltan los secretos de Supabase: el horario no hace nada hasta que se agreguen."
-              modo=nada
-            else
-              echo "::notice::Faltan los secretos de Supabase: solo se corre el diagnóstico (no se escribe nada)."
-              modo=diagnostico
-            fi
-          fi
+          # Sin secretos se escribe por el puente OIDC (lo normal en este repo público).
+          [ "$HAY_URL" != "true" ] || [ "$HAY_CLAVE" != "true" ] && echo "Escritura por el puente OIDC (sin claves en el repo)."
+          true
           echo "modo=$modo" >> "$GITHUB_OUTPUT"
           mkdir -p "$ESTADO"
 

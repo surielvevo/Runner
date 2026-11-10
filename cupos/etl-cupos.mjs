@@ -108,9 +108,30 @@ const PROFILE_DIR   = String(process.env.CHROME_PROFILE_DIR || '').trim();
 // true = saltarse el enfriamiento anti-bloqueo (solo para corridas manuales).
 const IGNORE_COOLDOWN = process.env.ETL_IGNORE_COOLDOWN === 'true';
 
-if (!SUPABASE_URL || !SERVICE_KEY) {
-  console.error('❌  Faltan NEXT_PUBLIC_SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY\n   node --env-file=.env.local scripts/etl-cupos.mjs');
+// (2026-11-10, Runner) PUENTE sin claves: en GitHub Actions el ETL no lleva la clave de
+// servicio. Se identifica con el token OIDC que GitHub firma para cada ejecución y la
+// función `etl-puente` de Supabase verifica esa firma (solo este repo, rama main, este
+// workflow) y escribe con la clave que vive allí. Con clave local, el camino de siempre.
+const PUENTE = sanitizeUrl(process.env.ETL_PUENTE);
+if (!(SUPABASE_URL && SERVICE_KEY) && !PUENTE) {
+  console.error('❌  Faltan NEXT_PUBLIC_SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY (o ETL_PUENTE en GitHub Actions)');
   process.exit(1);
+}
+let _oidc = { valor: null, vence: 0 };
+async function tokenGitHub() {
+  if (_oidc.valor && Date.now() < _oidc.vence - 90_000) return _oidc.valor;
+  const u = process.env.ACTIONS_ID_TOKEN_REQUEST_URL, t = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!u || !t) throw new Error('Sin token OIDC de GitHub (el workflow necesita permissions: id-token: write)');
+  const r = await fetch(`${u}&audience=cupopino-etl`, { headers: { Authorization: `Bearer ${t}` } });
+  const { value } = await r.json();
+  const exp = JSON.parse(Buffer.from(String(value).split('.')[1], 'base64url').toString()).exp * 1000;
+  _oidc = { valor: value, vence: exp };
+  return value;
+}
+async function fetchPuente(input, init = {}) {
+  const h = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
+  h.set('x-gh-oidc', await tokenGitHub());
+  return fetch(input, { ...init, headers: h });
 }
 
 if (!['full', 'priority', 'stale', 'delta'].includes(ETL_MODE)) {
@@ -118,7 +139,9 @@ if (!['full', 'priority', 'stale', 'delta'].includes(ETL_MODE)) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+const supabase = SUPABASE_URL && SERVICE_KEY
+  ? createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } })
+  : createClient(PUENTE, 'puente-oidc', { auth: { persistSession: false }, global: { fetch: fetchPuente } });
 
 function jitter() { return MIN_JITTER + Math.random() * (MAX_JITTER - MIN_JITTER); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

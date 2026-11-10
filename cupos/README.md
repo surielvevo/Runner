@@ -10,15 +10,16 @@ sin depender de ninguna computadora encendida.
 | `proxies.mjs` | Pool de proxies públicos: varias fuentes, prefiltro de red en paralelo (¿abre túnel hasta `app.uasd.edu.do:443`?) y prueba con navegador real. Los que pasan se recuerdan entre turnos. |
 | `diagnostico.mjs` | Comprueba, sin escribir nada, si la UASD responde desde el runner (directo y por proxies). |
 
-## Puesta en marcha
-1. **Settings → Secrets and variables → Actions → New repository secret**:
-   `NEXT_PUBLIC_SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY` (los mismos de Vercel).
-   Opcional: `PROXY_SCRAPER_KEY` (clave gratis de api.proxyscraper.com, más consultas por minuto).
-2. **Actions → Cupos UASD → Run workflow** con `modo = diagnostico` para ver si Cloudflare deja pasar.
-3. Con los secretos puestos, el horario arranca solo cada 30 min y encadena turnos.
+## Puesta en marcha (sin claves)
+Este repositorio público **no guarda ninguna clave**. Cada ejecución pide a GitHub un token de
+identidad (OIDC, `permissions: id-token: write`) y la función `etl-puente` de Supabase verifica su
+firma: solo acepta `surielvevo/Runner`, rama `main`, el workflow `cupos-uasd.yml`, disparado por
+horario o a mano en un runner de GitHub, y solo deja tocar `cupos_oficiales`, `campus_catalogo`,
+`etl_runs` y tres funciones del ETL. Escribe con la clave que vive dentro de Supabase.
+El horario arranca solo cada 30 min y encadena turnos. Opcional: secreto `PROXY_SCRAPER_KEY`.
 
 ## Seguridad
-- Los secretos solo viven en GitHub Secrets; nunca en el código ni en los registros.
+- Ninguna clave en el repo ni en GitHub: el token OIDC dura minutos y solo vale para este workflow en `main`.
 - Por un proxy solo viaja HTTPS de punta a punta (el navegador verifica el certificado). Supabase nunca va por proxy.
 - El workflow solo se dispara por horario o a mano: un fork o un pull request no ejecuta nada con los secretos.
 
