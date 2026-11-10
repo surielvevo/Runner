@@ -1,0 +1,178 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Cupos UASD · Programación docente de CupoPino (2026-11-10)
+# ─────────────────────────────────────────────────────────────────────────────
+# Sustituye al runner de la PC: corre en los servidores de GitHub (gratis e
+# ilimitado en un repositorio público), sin depender de ninguna computadora.
+#
+# Cómo trabaja:
+#   · Un TURNO dura ~5 h 40 min y encadena ciclos «priority» de hasta 50 min con
+#     el navegador caliente: las materias con menos cupos se refrescan primero y
+#     más seguido (la cola va por urgencia), igual que antes. Una vez al día, a
+#     partir de las 05:30 UTC (01:30 en RD), un barrido «full» de respaldo.
+#   · El lanzador corre cada 30 min; si ya hay un turno trabajando, el siguiente
+#     espera en cola (como máximo uno) y entra apenas termine: cobertura continua.
+#   · Cortés con la UASD: 3 consultas a la vez, pausas de 0,4–0,9 s, lotes de 40
+#     (parámetros del ETL de siempre). Nada de ráfagas.
+#   · Cloudflare: perfil de Chromium y proxies que ya pasaron se guardan entre
+#     turnos (caché); si la salida directa está bloqueada, el ETL busca un proxy
+#     público que pase (ver cupos/proxies.mjs).
+#
+# Secretos (Settings → Secrets and variables → Actions):
+#   NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   (obligatorios)
+#   PROXY_SCRAPER_KEY                                     (opcional, clave gratis de api.proxyscraper.com)
+# Sin los obligatorios, el turno solo corre el DIAGNÓSTICO (no escribe nada).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Cupos UASD
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'turno = ciclos priority continuos · full = barrido completo · diagnostico = solo comprobar si la UASD responde'
+        type: choice
+        default: turno
+        options: [turno, full, diagnostico]
+      horas:
+        description: 'Duración del turno en horas (máx. 5.6)'
+        default: '5.6'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cupos-uasd
+  cancel-in-progress: false
+
+jobs:
+  turno:
+    name: Turno de cupos
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        working-directory: cupos
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      PROXY_SCRAPER_KEY: ${{ secrets.PROXY_SCRAPER_KEY }}
+      ESTADO: ${{ github.workspace }}/.estado
+      HEADLESS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cupos/package-lock.json
+
+      - name: Dependencias
+        run: npm ci --no-audit --no-fund
+
+      - name: Caché de Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('cupos/package-lock.json') }}
+
+      - name: Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Perfil de Chromium (cookie cf_clearance) y proxies que ya pasaron, de un turno al siguiente.
+      - name: Recuperar estado del turno anterior
+        uses: actions/cache/restore@v4
+        with:
+          path: .estado
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: Plan
+        id: plan
+        env:
+          MODO: ${{ github.event.inputs.modo || 'turno' }}
+          HAY_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL != '' }}
+          HAY_CLAVE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' }}
+        run: |
+          modo="$MODO"
+          if [ "$HAY_URL" != "true" ] || [ "$HAY_CLAVE" != "true" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+              echo "::notice::Faltan los secretos de Supabase: el horario no hace nada hasta que se agreguen."
+              modo=nada
+            else
+              echo "::notice::Faltan los secretos de Supabase: solo se corre el diagnóstico (no se escribe nada)."
+              modo=diagnostico
+            fi
+          fi
+          echo "modo=$modo" >> "$GITHUB_OUTPUT"
+          mkdir -p "$ESTADO"
+
+      - name: Diagnóstico (¿la UASD responde?)
+        if: steps.plan.outputs.modo == 'diagnostico'
+        timeout-minutes: 25
+        run: xvfb-run -a node diagnostico.mjs
+
+      - name: Turno
+        if: steps.plan.outputs.modo == 'turno' || steps.plan.outputs.modo == 'full'
+        env:
+          MODO: ${{ steps.plan.outputs.modo }}
+          HORAS: ${{ github.event.inputs.horas || '5.6' }}
+          RUNNER_NAME: github-actions
+          CHROME_PROFILE_DIR: ${{ github.workspace }}/.estado/perfil
+          PROXY_CACHE: ${{ github.workspace }}/.estado/proxies-buenos.json
+          ETL_TRY_PROXY: 'true'
+          PROXY_HUNT_MIN: '5'
+          CLEAN_PROFILE_AFTER_STREAK: '4'
+          STALE_HOURS: '2'
+          HOT_THRESHOLD: '10'
+          ETL_PINNED_KEYS: 'LET1310'
+          PRO_HUNTER_ENABLED: 'false'
+        run: |
+          fin=$(( SECONDS + $(awk -v h="$HORAS" 'BEGIN{ if (h > 5.6) h = 5.6; printf "%d", h * 3600 }') ))
+          ciclo=0
+          while :; do
+            queda=$(( (fin - SECONDS) / 60 ))
+            [ "$queda" -lt 8 ] && break
+            hoy=$(date -u +%F); hhmm=$(date -u +%H%M)
+            modo=priority; deadline=$(( queda - 5 < 50 ? queda - 5 : 50 ))
+            if [ "$MODO" = "full" ] && [ "$ciclo" -eq 0 ]; then
+              modo=full; deadline=$(( queda - 5 < 240 ? queda - 5 : 240 ))
+            elif [ "$hhmm" -ge 0530 ] && [ ! -f "$ESTADO/full-$hoy" ] && [ "$queda" -ge 200 ]; then
+              modo=full; deadline=$(( queda - 5 < 240 ? queda - 5 : 240 )); touch "$ESTADO/full-$hoy"
+            fi
+            ciclo=$(( ciclo + 1 ))
+            echo "── Ciclo $ciclo · $modo · hasta $deadline min · $(date -u +%H:%M) UTC"
+            ETL_MODE=$modo ETL_DEADLINE_MIN=$deadline timeout $(( deadline * 60 + 240 )) xvfb-run -a node etl-cupos.mjs || echo "::warning::El ciclo $ciclo terminó con error; sigue el siguiente."
+            [ "$MODO" = "full" ] && break
+            sleep 20
+          done
+
+      - name: Guardar estado para el próximo turno
+        if: always() && steps.plan.outputs.modo != 'nada'
+        uses: actions/cache/save@v4
+        with:
+          path: .estado
+          key: estado-${{ github.run_id }}
+
+  # GitHub apaga los horarios de un repositorio público tras 60 días sin actividad.
+  # Si el último commit tiene más de 45 días, se deja un latido (un archivo con la fecha).
+  latido:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Latido
+        run: |
+          ultimo=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - ultimo )) -gt $(( 45 * 86400 )) ]; then
+            date -u +%FT%TZ > cupos/.latido
+            git config user.name "cupos-latido"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add cupos/.latido && git commit -m "Latido del horario de cupos" && git push
+          else
+            echo "Actividad reciente: no hace falta latido."
+          fi
