@@ -6,14 +6,20 @@
 # —un relevo que no llegó, una máquina de GitHub que murió a mitad—, el doctor lo ve
 # en su siguiente revisión y arranca uno. No toca la UASD ni la base: solo mira la
 # lista de ejecuciones de este repositorio y, si hace falta, pide un turno.
-# Corre cada 10 min (GitHub puede saltarse alguno; el relevo cubre el caso normal).
+# Corre cada 10 min (GitHub puede saltarse alguno; el relevo cubre el caso normal) y una
+# vez cada vez que se cambia este archivo.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Doctor de cupos
 
 on:
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '5,15,25,35,45,55 * * * *'
+  # Al cambiar este archivo, el doctor corre una vez: así se comprueba en el acto (y GitHub
+  # vuelve a registrar el horario, que la primera vez no disparó nunca).
+  push:
+    branches: [main]
+    paths: ['.github/workflows/doctor-cupos.yml']
   workflow_dispatch:
 
 permissions:
