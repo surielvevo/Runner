@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Doctor de cupos · que la programación nunca se quede sin turno (2026-11-11)
+# ─────────────────────────────────────────────────────────────────────────────
+# Segunda línea de defensa del workflow «Cupos UASD». La primera es su job `relevo`
+# (cada turno pide el siguiente al terminar). Si aun así no queda ningún turno vivo
+# —un relevo que no llegó, una máquina de GitHub que murió a mitad—, el doctor lo ve
+# en su siguiente revisión y arranca uno. No toca la UASD ni la base: solo mira la
+# lista de ejecuciones de este repositorio y, si hace falta, pide un turno.
+# Corre cada 10 min (GitHub puede saltarse alguno; el relevo cubre el caso normal).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Doctor de cupos
+
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cupos-doctor
+  cancel-in-progress: true
+
+jobs:
+  revisar:
+    name: ¿Hay un turno trabajando?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Revisar y, si no hay ninguno, arrancar un turno
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          vivos=""
+          for i in 1 2 3; do
+            vivos=$(gh run list -R "$GITHUB_REPOSITORY" --workflow cupos-uasd.yml --limit 20 \
+              --json status -q '[.[] | select(.status != "completed")] | length') && break
+            sleep $(( i * 10 ))
+          done
+          if [ -z "$vivos" ]; then echo "::warning::No se pudo leer la lista de turnos; se reintenta en la próxima revisión."; exit 0; fi
+          echo "Turnos trabajando o en cola: $vivos"
+          if [ "$vivos" -gt 0 ]; then echo "Todo en orden."; exit 0; fi
+          echo "::warning::No había ningún turno: el doctor arranca uno."
+          for i in 1 2 3 4 5; do
+            gh workflow run cupos-uasd.yml -R "$GITHUB_REPOSITORY" --ref main -f modo=turno -f horas=5.6 && { echo "Turno pedido."; exit 0; }
+            sleep $(( i * 15 ))
+          done
+          echo "::error::El doctor no pudo pedir un turno."
+          exit 1

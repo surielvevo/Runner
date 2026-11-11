@@ -180,6 +180,40 @@ async function loadDynamicPinnedKeys() {
   }
 }
 
+// ── Carril de DEMANDA (2026-11-11) ────────────────────────────────────────────
+// Lo que un estudiante abre en la programación de CupoPino con datos de más de 2 min
+// queda pedido en `cupos_demanda` (como mucho una vez por minuto y materia, para
+// todos). Cada turno lo lee como mucho cada DEMANDA_CADA_MS (1 RPC diminuta por el
+// puente) y mete las de SU parte del catálogo justo después del lote en curso, o lo
+// despierta del reposo. NO sube el ritmo de consultas a la UASD: reordena el mismo
+// caudal, igual que las claves vigiladas. Tope por vuelta para que una avalancha de
+// pedidos nunca deje sin turno al resto del catálogo. Si la RPC falla: cero efecto.
+const DEMANDA_CADA_MS = Math.max(15_000, Number(process.env.DEMANDA_CADA_MS || 30_000));
+const DEMANDA_TOPE = Math.max(1, Math.min(20, Number(process.env.DEMANDA_TOPE || 6)));
+let demandaLeidaEn = 0;
+const demandaAtendida = new Map(); // clave del catálogo → cuándo entró a la cola (no repetir en 60 s)
+const colaDemanda = [];
+async function revisarDemanda(clavePorNorm, forzar = false) {
+  if (ETL_MODE !== 'priority' || !clavePorNorm) return colaDemanda.length;
+  if (!forzar && Date.now() - demandaLeidaEn < DEMANDA_CADA_MS) return colaDemanda.length;
+  demandaLeidaEn = Date.now();
+  try {
+    const { data, error } = await withTimeout(supabase.rpc('etl_demanda'), 8_000, 'DEMANDA_TIMEOUT');
+    if (error || !Array.isArray(data)) return colaDemanda.length;
+    const ahora = Date.now();
+    for (const row of data) {
+      if (colaDemanda.length >= DEMANDA_TOPE) break;
+      const clave = clavePorNorm.get(normalizeClave(row && typeof row === 'object' ? row.clave : row));
+      if (!clave) continue; // no es de este turno (o ya no está en el universo)
+      if (ahora - (demandaAtendida.get(clave) || 0) < 60_000) continue;
+      demandaAtendida.set(clave, ahora);
+      colaDemanda.push(clave);
+    }
+  } catch { /* sin demanda: la cola normal sigue igual */ }
+  return colaDemanda.length;
+}
+function tomarDemanda() { return colaDemanda.splice(0); }
+
 // Lista AUTORITATIVA del carril de 5 s. A diferencia de PINNED_KEYS, esta lista
 // se reemplaza en cada lectura: si un Pro desactiva/consigue una materia deja de
 // consumir el worker sin esperar al próximo job. etl_claves_vigiladas devuelve
@@ -1344,6 +1378,8 @@ async function main() {
   // de GitHub, con su propia IP, y se queda con una parte fija del catálogo (hash de
   // la clave). Misma cortesía por IP; el catálogo entero se refresca N veces más rápido.
   const claves = SHARD_TOTAL > 1 ? universo.filter((c) => shardDe(c) === SHARD_INDEX) : universo;
+  // Clave normalizada → clave tal como la lista la UASD (para el carril de demanda).
+  const clavePorNorm = new Map(claves.map((c) => [normalizeClave(c), c]));
   console.log(`   Total universo: ${universo.length} claves${SHARD_TOTAL > 1 ? ` · turno ${SHARD_INDEX + 1}/${SHARD_TOTAL}: ${claves.length}` : ''}.`);
   if (!claves.length) {
     await hbEnd('error', { detail: 'getAsignaturas devolvió 0 claves' });
@@ -1466,6 +1502,13 @@ async function main() {
         console.warn(`\n   ⏸ La UASD nos frenó (${limitedInBatch}/${batch.length}); enfriando ${(cool / 1000).toFixed(0)}s…`);
         await sleep(cool);
       }
+
+      // Carril de demanda: lo que los estudiantes acaban de abrir entra justo después de este lote.
+      if (await revisarDemanda(clavePorNorm)) {
+        const pedidas = tomarDemanda();
+        list.splice(b + BATCH_SIZE, 0, ...pedidas);
+        console.log(`\n   👀 Demanda: ${pedidas.length} materia(s) que están consultando entran al frente (${pedidas.join(', ')}).`);
+      }
     }
     return failed;
   }
@@ -1519,7 +1562,13 @@ async function main() {
       state = await getClaveState();
       if (ETL_MODE === 'priority') await loadDynamicPinnedKeys();
     }
-    const selectedTargets = selectTargets(claves, state);
+    // Lo que los estudiantes están consultando va primero en la pasada.
+    await revisarDemanda(clavePorNorm, true);
+    const pedidasPase = tomarDemanda();
+    const selectedTargets = pedidasPase.length
+      ? [...new Set([...pedidasPase, ...selectTargets(claves, state)])]
+      : selectTargets(claves, state);
+    if (pedidasPase.length) console.log(`   👀 Demanda: ${pedidasPase.length} materia(s) consultadas al frente de la pasada.`);
     lastTargets = selectedTargets.length;
     if (!selectedTargets.length) {
       // Nada vencido ahora mismo: en priority espera corta y re-evalúa (sin spin,
@@ -1536,7 +1585,12 @@ async function main() {
         }
         const esperaMs = Math.max(45_000, Math.min(600_000, Math.round(proximaMs)), 0);
         await hbBeat({ detail: `pasada ${pass}: nada vencido; espera ${Math.round(esperaMs / 1000)} s` });
-        await sleep(Math.min(esperaMs, Math.max(45_000, (minutesLeft() - LOOP_MARGIN_MIN) * 60_000)));
+        // El reposo se interrumpe si un estudiante consulta una materia de este turno.
+        const despiertaEn = Date.now() + Math.min(esperaMs, Math.max(45_000, (minutesLeft() - LOOP_MARGIN_MIN) * 60_000));
+        while (Date.now() < despiertaEn) {
+          await sleep(Math.min(DEMANDA_CADA_MS, Math.max(1_000, despiertaEn - Date.now())));
+          if (await revisarDemanda(clavePorNorm)) { console.log('   👀 Demanda durante el reposo: se despierta.'); break; }
+        }
         continue;
       }
       break;
