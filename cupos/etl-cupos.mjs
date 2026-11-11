@@ -48,6 +48,14 @@ function sanitizeUrl(raw) {
 const SUPABASE_URL  = sanitizeUrl(process.env.NEXT_PUBLIC_SUPABASE_URL);
 const SERVICE_KEY   = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const ETL_MODE      = (process.env.ETL_MODE || 'full').toLowerCase();
+// Turnos paralelos: ETL_SHARDS=3 y ETL_SHARD=0|1|2 (uno por máquina de GitHub).
+const SHARD_TOTAL   = Math.max(1, Math.min(8, parseInt(process.env.ETL_SHARDS || '1', 10) || 1));
+const SHARD_INDEX   = Math.min(SHARD_TOTAL - 1, Math.max(0, parseInt(process.env.ETL_SHARD || '0', 10) || 0));
+function shardDe(clave) {
+  let h = 2166136261; // FNV-1a: estable entre corridas y entre máquinas
+  for (const ch of String(clave).trim().toUpperCase()) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); }
+  return (h >>> 0) % SHARD_TOTAL;
+}
 const STALE_HOURS   = Number(process.env.STALE_HOURS || 6);
 const HOT_THRESHOLD = Number(process.env.HOT_THRESHOLD || 10);
 // Claves fijadas por operación: se consultan en cada ciclo priority aunque su
@@ -1331,8 +1339,12 @@ async function main() {
     }
   }
 
-  const claves = [...claveSet].filter(Boolean).sort();
-  console.log(`   Total universo: ${claves.length} claves.`);
+  const universo = [...claveSet].filter(Boolean).sort();
+  // Reparto en turnos paralelos (ETL_SHARDS): cada turno corre en su propia máquina
+  // de GitHub, con su propia IP, y se queda con una parte fija del catálogo (hash de
+  // la clave). Misma cortesía por IP; el catálogo entero se refresca N veces más rápido.
+  const claves = SHARD_TOTAL > 1 ? universo.filter((c) => shardDe(c) === SHARD_INDEX) : universo;
+  console.log(`   Total universo: ${universo.length} claves${SHARD_TOTAL > 1 ? ` · turno ${SHARD_INDEX + 1}/${SHARD_TOTAL}: ${claves.length}` : ''}.`);
   if (!claves.length) {
     await hbEnd('error', { detail: 'getAsignaturas devolvió 0 claves' });
     await stopProHunter();
@@ -1549,10 +1561,13 @@ async function main() {
   await closeBrowserSafe();
 
   // ── 4. Refresh búsqueda ────────────────────────────────────────────────────
-  console.log('4. refresh_asignaturas_busqueda…');
-  const { error: re } = await supabase.rpc('refresh_asignaturas_busqueda');
-  if (re) console.warn('   ⚠', re.message);
-  else console.log('   ✓ OK.');
+  // Con turnos paralelos, solo el primero refresca la búsqueda (es global).
+  if (SHARD_INDEX === 0) {
+    console.log('4. refresh_asignaturas_busqueda…');
+    const { error: re } = await supabase.rpc('refresh_asignaturas_busqueda');
+    if (re) console.warn('   ⚠', re.message);
+    else console.log('   ✓ OK.');
+  }
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`\n══════════════════════════════════════════`);

@@ -54,9 +54,16 @@ concurrency:
 
 jobs:
   turno:
-    name: Turno de cupos
+    name: Turno de cupos ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    # Tres turnos en paralelo, cada uno en su propia máquina (su propia IP) con una
+    # parte fija del catálogo: el triple de lecturas por minuto con la MISMA cortesía
+    # por IP (3 consultas a la vez, pausas de 0,4–0,9 s).
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     defaults:
       run:
         working-directory: cupos
@@ -65,6 +72,8 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       PROXY_SCRAPER_KEY: ${{ secrets.PROXY_SCRAPER_KEY }}
       ESTADO: ${{ github.workspace }}/.estado
+      ETL_SHARDS: '3'
+      ETL_SHARD: ${{ matrix.shard }}
       HEADLESS: 'false'
       # Puente sin claves (función de Supabase que verifica el token OIDC de este workflow).
       ETL_PUENTE: https://gntczowattweopbrasxs.supabase.co/functions/v1/etl-puente
@@ -94,8 +103,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .estado
-          key: estado-${{ github.run_id }}
-          restore-keys: estado-
+          key: estado-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: |
+            estado-${{ matrix.shard }}-
+            estado-
 
       - name: Plan
         id: plan
@@ -117,7 +128,7 @@ jobs:
           mkdir -p "$ESTADO"
 
       - name: Diagnóstico (¿la UASD responde?)
-        if: steps.plan.outputs.modo == 'diagnostico'
+        if: steps.plan.outputs.modo == 'diagnostico' && matrix.shard == 0
         timeout-minutes: 25
         run: xvfb-run -a node diagnostico.mjs
 
@@ -126,7 +137,10 @@ jobs:
         env:
           MODO: ${{ steps.plan.outputs.modo }}
           HORAS: ${{ github.event.inputs.horas || '5.6' }}
-          RUNNER_NAME: github-actions
+          RUNNER_NAME: github-actions-${{ matrix.shard }}
+          # Frescura: con tres turnos hay caudal para revisar cada materia el doble de seguido
+          # (a menos cupos, más seguido; la escala de urgencia es la misma de siempre).
+          PRIORITY_SPEED: '0.5'
           CHROME_PROFILE_DIR: ${{ github.workspace }}/.estado/perfil
           PROXY_CACHE: ${{ github.workspace }}/.estado/proxies-buenos.json
           ETL_TRY_PROXY: 'true'
@@ -161,7 +175,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .estado
-          key: estado-${{ github.run_id }}
+          key: estado-${{ matrix.shard }}-${{ github.run_id }}
 
   # GitHub apaga los horarios de un repositorio público tras 60 días sin actividad.
   # Si el último commit tiene más de 45 días, se deja un latido (un archivo con la fecha).
