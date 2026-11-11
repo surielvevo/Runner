@@ -9,8 +9,12 @@
 #     el navegador caliente: las materias con menos cupos se refrescan primero y
 #     más seguido (la cola va por urgencia), igual que antes. Una vez al día, a
 #     partir de las 05:30 UTC (01:30 en RD), un barrido «full» de respaldo.
-#   · El lanzador corre cada 30 min; si ya hay un turno trabajando, el siguiente
-#     espera en cola (como máximo uno) y entra apenas termine: cobertura continua.
+#   · RELEVO (2026-11-11): al terminar, cada turno pide él mismo el siguiente (job
+#     `relevo`). El horario de cada 30 min queda solo de respaldo: GitHub descarta la
+#     mayoría de los horarios seguidos (ese día disparó 3 de 36) y la programación
+#     pasó 5 h sin turno. Si el turno falla, el relevo espera 5 min y vuelve a pedir;
+#     cancelar un turno a mano SÍ detiene la cadena (para pararla del todo: desactivar
+#     el workflow en la pestaña Actions).
 #   · Cortés con la UASD: 3 consultas a la vez, pausas de 0,4–0,9 s, lotes de 40
 #     (parámetros del ETL de siempre). Nada de ráfagas.
 #   · Cloudflare: perfil de Chromium y proxies que ya pasaron se guardan entre
@@ -95,8 +99,20 @@ jobs:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('cupos/package-lock.json') }}
 
+      # La red de las máquinas de GitHub a veces no resuelve los espejos de Ubuntu: el
+      # 2026-11-11 a las 15:15 UTC los tres turnos murieron aquí. Se reintenta con espera y,
+      # como último recurso, se instala el navegador sin los paquetes del sistema.
       - name: Chromium
-        run: npx playwright install --with-deps chromium
+        run: |
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-reintentos >/dev/null
+          for i in 1 2 3 4 5; do
+            npx playwright install --with-deps chromium && exit 0
+            echo "::warning::La instalación del navegador falló (intento $i de 5); reintento en $(( i * 30 )) s."
+            sleep $(( i * 30 ))
+            sudo apt-get update -qq || true
+          done
+          echo "::warning::Sin los paquetes del sistema: se instala solo el navegador."
+          npx playwright install chromium
 
       # Perfil de Chromium (cookie cf_clearance) y proxies que ya pasaron, de un turno al siguiente.
       - name: Recuperar estado del turno anterior
@@ -176,6 +192,35 @@ jobs:
         with:
           path: .estado
           key: estado-${{ matrix.shard }}-${{ github.run_id }}
+
+  # El siguiente turno lo pide este mismo turno al terminar (bien o con error). Un turno
+  # cancelado a mano no se releva. Un fallo espera 5 min antes de pedir (sin bucles rápidos).
+  relevo:
+    name: Relevo del turno
+    needs: turno
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.modo != 'diagnostico') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Pedir el siguiente turno
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTADO: ${{ needs.turno.result }}
+        run: |
+          if [ "$RESULTADO" != "success" ]; then
+            echo "::warning::El turno terminó con «$RESULTADO»: se espera 5 min antes de pedir el siguiente."
+            sleep 300
+          fi
+          for i in 1 2 3 4 5; do
+            gh workflow run cupos-uasd.yml -R "$GITHUB_REPOSITORY" --ref main -f modo=turno -f horas=5.6 && { echo "Siguiente turno pedido."; exit 0; }
+            echo "::warning::No se pudo pedir el siguiente turno (intento $i de 5)."
+            sleep $(( i * 20 ))
+          done
+          echo "::error::No se pudo pedir el siguiente turno: queda el horario de respaldo."
+          exit 1
 
   # GitHub apaga los horarios de un repositorio público tras 60 días sin actividad.
   # Si el último commit tiene más de 45 días, se deja un latido (un archivo con la fecha).

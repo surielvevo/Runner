@@ -16,7 +16,7 @@ identidad (OIDC, `permissions: id-token: write`) y la función `etl-puente` de S
 firma: solo acepta `surielvevo/Runner`, rama `main`, el workflow `cupos-uasd.yml`, disparado por
 horario o a mano en un runner de GitHub, y solo deja tocar `cupos_oficiales`, `campus_catalogo`,
 `etl_runs` y tres funciones del ETL. Escribe con la clave que vive dentro de Supabase.
-El horario arranca solo cada 30 min y encadena turnos. Opcional: secreto `PROXY_SCRAPER_KEY`.
+Cada turno pide el siguiente al terminar (job `relevo`); el horario de cada 30 min queda de respaldo. Opcional: secreto `PROXY_SCRAPER_KEY`.
 
 ## Seguridad
 - Ninguna clave en el repo ni en GitHub: el token OIDC dura minutos y solo vale para este workflow en `main`.
