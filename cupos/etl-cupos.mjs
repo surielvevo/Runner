@@ -1525,8 +1525,18 @@ async function main() {
       // Nada vencido ahora mismo: en priority espera corta y re-evalúa (sin spin,
       // manteniendo el navegador caliente); en los demás modos, no hay nada → salir.
       if (LOOP_ENABLED && minutesLeft() > LOOP_MARGIN_MIN) {
-        await hbBeat({ detail: `pasada ${pass}: nada vencido; espera corta` });
-        await sleep(45000);
+        // Espera hasta que la PRÓXIMA clave de este turno vence (45 s – 10 min), en vez de
+        // releer el estado completo cada 45 s: lo mismo de fresco, mucha menos salida de Supabase.
+        let proximaMs = 600_000;
+        for (const c of claves) {
+          const st = state.get(c.toUpperCase());
+          if (!st) continue;
+          const faltaMs = (refreshBudgetHours(st.minDisp) - st.ageH) * 3_600_000;
+          if (faltaMs < proximaMs) proximaMs = faltaMs;
+        }
+        const esperaMs = Math.max(45_000, Math.min(600_000, Math.round(proximaMs)), 0);
+        await hbBeat({ detail: `pasada ${pass}: nada vencido; espera ${Math.round(esperaMs / 1000)} s` });
+        await sleep(Math.min(esperaMs, Math.max(45_000, (minutesLeft() - LOOP_MARGIN_MIN) * 60_000)));
         continue;
       }
       break;
