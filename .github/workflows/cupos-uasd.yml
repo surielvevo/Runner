@@ -67,8 +67,10 @@ permissions:
 
 # Una máquina de reemplazo (turno 0/1/2) corre en su propio grupo: entra al momento, mientras
 # las otras dos partes del turno principal siguen trabajando.
+# OJO: en las expresiones de GitHub `null == '0'` es verdadero (compara como números), así que la
+# entrada `turno` solo se mira en ejecuciones manuales, donde siempre llega como texto.
 concurrency:
-  group: ${{ (github.event_name == 'push' && !contains(github.event.head_commit.message, '[turno]') && 'cupos-uasd-diagnostico') || (contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && format('cupos-uasd-reemplazo-{0}', github.event.inputs.turno)) || 'cupos-uasd' }}
+  group: ${{ (github.event_name == 'push' && !contains(github.event.head_commit.message, '[turno]') && 'cupos-uasd-diagnostico') || ((github.event_name == 'workflow_dispatch' && (github.event.inputs.turno == '0' || github.event.inputs.turno == '1' || github.event.inputs.turno == '2')) && format('cupos-uasd-reemplazo-{0}', github.event.inputs.turno)) || 'cupos-uasd' }}
   cancel-in-progress: false
 
 jobs:
@@ -87,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && format('[{0}]', github.event.inputs.turno) || '[0, 1, 2]') }}
+        shard: ${{ fromJSON((github.event_name == 'workflow_dispatch' && (github.event.inputs.turno == '0' || github.event.inputs.turno == '1' || github.event.inputs.turno == '2')) && format('[{0}]', github.event.inputs.turno) || '[0, 1, 2]') }}
     defaults:
       run:
         working-directory: cupos
@@ -281,7 +283,7 @@ jobs:
     name: Relevo del turno
     needs: turno
     # Una máquina de reemplazo no se releva: el relevo lo pide el turno principal.
-    if: ${{ !cancelled() && !contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.modo != 'diagnostico') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]'))) }}
+    if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && (github.event.inputs.turno == '0' || github.event.inputs.turno == '1' || github.event.inputs.turno == '2')) && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.modo != 'diagnostico') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
