@@ -4,10 +4,20 @@
 # Segunda línea de defensa del workflow «Cupos UASD». La primera es su job `relevo`
 # (cada turno pide el siguiente al terminar). Si aun así no queda ningún turno vivo
 # —un relevo que no llegó, una máquina de GitHub que murió a mitad—, el doctor lo ve
-# en su siguiente revisión y arranca uno. No toca la UASD ni la base: solo mira la
-# lista de ejecuciones de este repositorio y, si hace falta, pide un turno.
+# en su siguiente revisión y arranca uno. No toca la UASD.
 # Corre cada 10 min (GitHub puede saltarse alguno; el relevo cubre el caso normal) y una
 # vez cada vez que se cambia este archivo.
+#
+# (2026-11-21) Además mira si los DATOS están al día, no solo si hay un turno: del 16 al
+# 21-nov siempre hubo turno vivo y aun así el 90 % del catálogo llegó a tener 5 días. Con UNA
+# lectura agregada (`etl_salud`, por el puente OIDC, que al doctor solo le deja esa función):
+#   · grave  = nada escrito en 45 min, o una parte del catálogo sin latido en 60 min → abre
+#              (o actualiza cada 6 h) un aviso «cupos-salud» en Issues: GitHub lo notifica al dueño;
+#   · aviso  = el catálogo va atrasado pero se está escribiendo (p. ej. poniéndose al día):
+#              solo queda en el resumen de la ejecución, sin molestar;
+#   · sano   = cierra el aviso abierto, con la hora de la recuperación.
+# Las curas automáticas viven en el propio turno (ritmo, descanso por IP, máquina nueva ante un
+# veto): el doctor no rota IP para esquivar un freno de la UASD.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Doctor de cupos
@@ -25,6 +35,9 @@ on:
 permissions:
   actions: write
   contents: read
+  issues: write
+  # Token de identidad para leer la salud por el puente `etl-puente` (sin claves en el repo).
+  id-token: write
 
 concurrency:
   group: cupos-doctor
@@ -32,7 +45,7 @@ concurrency:
 
 jobs:
   revisar:
-    name: ¿Hay un turno trabajando?
+    name: ¿Hay un turno trabajando y los datos al día?
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -56,3 +69,90 @@ jobs:
           done
           echo "::error::El doctor no pudo pedir un turno."
           exit 1
+
+      - name: ¿Los datos están al día? (una lectura agregada)
+        id: salud
+        if: ${{ !cancelled() }}
+        env:
+          PUENTE: https://gntczowattweopbrasxs.supabase.co/functions/v1/etl-puente
+        run: |
+          token=$(curl -sS --retry 2 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cupopino-etl" | jq -r '.value // empty')
+          salud=""
+          if [ -n "$token" ]; then
+            salud=$(curl -sS -f --retry 2 --max-time 30 -X POST "$PUENTE/rest/v1/rpc/etl_salud" \
+              -H "x-gh-oidc: $token" -H 'Content-Type: application/json' -d '{}' || true)
+          fi
+          if [ -z "$salud" ] || ! echo "$salud" | jq -e '.catalogo' >/dev/null 2>&1; then
+            echo "::warning::No se pudo leer la salud de los datos; se reintenta en la próxima revisión."
+            echo "estado=desconocido" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$salud" > salud.json
+          # grave: nada escrito en 45 min o una parte del catálogo sin latido en 60 min.
+          # aviso: catálogo atrasado (< 85 % leído en 8 h, < 60 % de las apretadas en 30 min) o
+          #        demanda de estudiantes mal atendida, pero escribiéndose.
+          estado=$(jq -r '
+            def pct(a; b): if b > 0 then (100 * a / b) else 100 end;
+            (.ultima_escritura_min // 99999) as $esc
+            | ([.turnos[] | select(.turno | startswith("turno ")) | select(.latido_min > 60)] | length) as $muertos
+            | if $esc > 45 or $muertos > 0 then "grave"
+              elif pct(.catalogo.leidas_8h; .catalogo.claves) < 85
+                or pct(.catalogo.apretadas_30m; .catalogo.apretadas) < 60
+                or (.demanda_1h.pedidas >= 5 and pct(.demanda_1h.atendidas; .demanda_1h.pedidas) < 50)
+              then "aviso" else "sano" end' salud.json)
+          resumen=$(jq -r '
+            "| Señal | Valor |\n|---|---|\n" +
+            "| Última lectura escrita | hace \(.ultima_escritura_min // "?") min |\n" +
+            "| Catálogo leído en 1 h / 8 h / 24 h | \(.catalogo.leidas_1h) / \(.catalogo.leidas_8h) / \(.catalogo.leidas_24h) de \(.catalogo.claves) |\n" +
+            "| Apretadas (≤ 10 cupos) leídas en 30 min | \(.catalogo.apretadas_30m) de \(.catalogo.apretadas) |\n" +
+            "| Pedidas por estudiantes en 1 h / atendidas | \(.demanda_1h.pedidas) / \(.demanda_1h.atendidas) |\n\n" +
+            "| Parte | Estado | Latido | Filas 1 h | Bloqueos 1 h | Errores 1 h | Detalle |\n|---|---|---|---|---|---|---|\n" +
+            ([.turnos[] | "| \(.turno) | \(.estado) | hace \(.latido_min) min | \(.filas_1h) | \(.bloqueos_1h) | \(.errores_1h) | \(.detalle | gsub("\\|"; "/") | .[0:160]) |"] | join("\n"))' salud.json)
+          echo "Salud de los datos: $estado"
+          { echo "## Salud de los datos: $estado"; echo; echo "$resumen"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "estado=$estado" >> "$GITHUB_OUTPUT"
+          { echo "resumen<<FIN_RESUMEN"; echo "$resumen"; echo "FIN_RESUMEN"; } >> "$GITHUB_OUTPUT"
+
+      - name: Avisar al dueño o cerrar el aviso
+        if: ${{ !cancelled() && (steps.salud.outputs.estado == 'grave' || steps.salud.outputs.estado == 'sano') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ESTADO: ${{ steps.salud.outputs.estado }}
+          RESUMEN: ${{ steps.salud.outputs.resumen }}
+        run: |
+          abierto=$(gh issue list -R "$GITHUB_REPOSITORY" --label cupos-salud --state open --limit 1 \
+            --json number,updatedAt -q 'if length > 0 then "\(.[0].number) \(.[0].updatedAt)" else empty end' 2>/dev/null || true)
+          ahora=$(date -u +'%Y-%m-%d %H:%M UTC')
+          if [ "$ESTADO" = "sano" ]; then
+            if [ -n "$abierto" ]; then
+              n=${abierto%% *}
+              gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "Recuperado ($ahora): los datos vuelven a estar al día.
+
+          $RESUMEN"
+              gh issue close "$n" -R "$GITHUB_REPOSITORY"
+              echo "Aviso #$n cerrado: datos al día."
+            fi
+            exit 0
+          fi
+          # grave
+          if [ -z "$abierto" ]; then
+            gh label create cupos-salud -R "$GITHUB_REPOSITORY" --color B60205 \
+              --description "El doctor de cupos ve los datos de la programación sin actualizar" 2>/dev/null || true
+            gh issue create -R "$GITHUB_REPOSITORY" --label cupos-salud \
+              --title "Doctor de cupos: la programación no se está actualizando" \
+              --body "El doctor de cupos detectó ($ahora) que los cupos no se están escribiendo o que una parte del catálogo dejó de latir.
+
+          $RESUMEN
+
+          Qué hace el sistema solo: baja el ritmo si la UASD frena, deja descansar una IP bloqueada y pide otra máquina si la UASD la veta desde el primer contacto. Este aviso se cierra solo cuando los datos vuelvan a estar al día."
+            echo "::warning::Aviso abierto en Issues."
+          else
+            n=${abierto%% *}; t=${abierto#* }
+            if [ $(( $(date +%s) - $(date -d "$t" +%s) )) -ge 21600 ]; then
+              gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "Sigue sin actualizarse ($ahora).
+
+          $RESUMEN"
+            fi
+            echo "::warning::Aviso #$n sigue abierto."
+          fi

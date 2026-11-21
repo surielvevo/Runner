@@ -307,6 +307,14 @@ jobs:
           echo "::error::No se pudo pedir el siguiente turno: queda el horario de respaldo."
           exit 1
 
+      # (2026-11-21) El horario del doctor solo se disparó 2 veces en 12 h (GitHub descarta la
+      # mayoría): cada relevo lo despierta, así revisa la salud de los datos al menos cada turno.
+      - name: Despertar al doctor
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run doctor-cupos.yml -R "$GITHUB_REPOSITORY" --ref main || echo "::warning::No se pudo despertar al doctor."
+
   # GitHub apaga los horarios de un repositorio público tras 60 días sin actividad.
   # Si el último commit tiene más de 45 días, se deja un latido (un archivo con la fecha).
   latido:
