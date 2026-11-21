@@ -5,7 +5,8 @@
   "description": "Actualiza la Programación docente (cupos) de CupoPino desde GitHub Actions.",
   "scripts": {
     "etl": "node etl-cupos.mjs",
-    "diagnostico": "node diagnostico.mjs"
+    "diagnostico": "node diagnostico.mjs",
+    "test": "node --test pruebas/*.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.99.2",

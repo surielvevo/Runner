@@ -9,6 +9,7 @@
 
 import { chromium } from 'playwright';
 import { listaDeProxies, prefiltrar } from './proxies.mjs';
+import { esBloqueoDuro } from './ritmo.mjs';
 
 const PAGINA = 'https://app.uasd.edu.do/ProgramacionPorAsignatura/Default.aspx';
 const HEADLESS = process.env.HEADLESS !== 'false';
@@ -29,6 +30,8 @@ async function probar(proxy, esperaMs = 45_000) {
     let titulo = await p.title().catch(() => '');
     while (bloqueado(titulo) && Date.now() - t0 < esperaMs) { await dormir(2500); titulo = await p.title().catch(() => ''); }
     if (bloqueado(titulo)) return { ok: false, motivo: `Cloudflare («${titulo.slice(0, 40)}»)`, ms: Date.now() - t0 };
+    // (2026-11-21) El veto propio de la UASD («403 Prohibido») carga como página normal.
+    if (esBloqueoDuro(titulo)) return { ok: false, motivo: `veto de la UASD («${titulo.slice(0, 50)}»)`, ms: Date.now() - t0 };
     const campus = await p.evaluate(() => new Promise((res) => {
       const x = new XMLHttpRequest();
       x.open('POST', 'Default.aspx/getCampus', true);
@@ -38,7 +41,21 @@ async function probar(proxy, esperaMs = 45_000) {
       x.onerror = x.ontimeout = () => res(-3);
       x.send('{}');
     }));
-    return { ok: campus > 0, motivo: campus > 0 ? `${campus} recintos leídos` : `la página abrió pero la consulta devolvió ${campus}`, ms: Date.now() - t0 };
+    // Una sola consulta de cupos (la que la UASD empezó a frenar el 16-nov): código HTTP y Retry-After.
+    let datos = '';
+    if (campus > 0 && !proxy) {
+      const r = await p.evaluate(() => fetch('Default.aspx/getData', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
+        body: JSON.stringify({ campus: '000', clave: 'MAT0140' }),
+      }).then(async (res) => {
+        const t = await res.text();
+        let n = -1; try { n = JSON.parse(JSON.parse(t).d).length; } catch { /* no es JSON */ }
+        return { status: res.status, ra: res.headers.get('retry-after'), n };
+      }).catch((e) => ({ status: 0, ra: null, n: -1, err: String(e && e.message || e).slice(0, 60) })));
+      datos = ` · getData MAT0140: HTTP ${r.status}${r.ra ? ` (Retry-After ${r.ra})` : ''}${r.n >= 0 ? ` · ${r.n} secciones` : ''}${r.err ? ` · ${r.err}` : ''}`;
+    }
+    return { ok: campus > 0, motivo: (campus > 0 ? `${campus} recintos leídos` : `la página abrió pero la consulta devolvió ${campus}`) + datos, ms: Date.now() - t0 };
   } catch (e) {
     return { ok: false, motivo: String(e.message || e).split('\n')[0].slice(0, 90), ms: Date.now() - t0 };
   } finally { try { await b?.close(); } catch { /* nada */ } }

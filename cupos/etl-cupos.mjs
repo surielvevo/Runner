@@ -34,8 +34,13 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
 import { chromium } from 'playwright';
 import { createClient } from '@supabase/supabase-js';
+import {
+  NIVELES, ritmoInicial, ajustarRitmo, intervaloHoras, compararLectura, periodoDominante,
+  confirmarFaltantes, esBloqueoDuro, esErrorDeBloqueo, descansoMin,
+} from './ritmo.mjs';
 
 // Tolera errores comunes de pegado en el secret: espacios, saltos de línea,
 // comillas envolventes y falta de esquema (https://). NO imprime el valor.
@@ -115,6 +120,79 @@ const RUNNER_NAME   = String(process.env.RUNNER_NAME || process.env.COMPUTERNAME
 const PROFILE_DIR   = String(process.env.CHROME_PROFILE_DIR || '').trim();
 // true = saltarse el enfriamiento anti-bloqueo (solo para corridas manuales).
 const IGNORE_COOLDOWN = process.env.ETL_IGNORE_COOLDOWN === 'true';
+
+// ── (2026-11-21) Ritmo que se adapta a la UASD y memoria de lo leído ──────────
+// Ver ritmo.mjs. RITMO_TOPE = escalón más rápido permitido (0 = el ritmo de antes del
+// 16-nov, 1 = por defecto); RITMO_ARRANQUE = escalón con que arranca sin memoria.
+const RITMO_TOPE      = Math.max(0, Math.min(NIVELES.length - 1, parseInt(process.env.RITMO_TOPE ?? '1', 10) || 0));
+const RITMO_ARRANQUE  = Math.max(RITMO_TOPE, Math.min(NIVELES.length - 1, parseInt(process.env.RITMO_ARRANQUE ?? '3', 10) || 3));
+// Un lote nunca pasa de LOTE_MAX_MS: así un estudiante que abre una materia espera como
+// mucho eso a que su consulta entre, aunque el ritmo sea lento.
+const LOTE_MAX_MS     = Math.max(20_000, Number(process.env.LOTE_MAX_MS || 75_000));
+// Frenos seguidos que detienen el lote en el acto (no seguir golpeando a la UASD).
+const FRENO_SEGUIDOS  = Math.max(1, Number(process.env.FRENO_SEGUIDOS || 3));
+// Cada cuánto se relee el estado agregado de la base (claves_estado). Entre lecturas, el
+// turno lleva la cuenta él mismo: solo él escribe sus claves.
+const ESTADO_CADA_MS  = Math.max(60_000, Number(process.env.ESTADO_CADA_MS || 10 * 60_000));
+// Carpeta que el workflow conserva entre turnos (caché): memoria por clave, ritmo y señales
+// para el bucle del turno (espera-s, veto-ip, lecturas-ok). Vacía = sin memoria (local).
+const ESTADO_DIR      = String(process.env.ESTADO || '').trim();
+const MEMORIA_ARCHIVO = ESTADO_DIR ? path.join(ESTADO_DIR, 'memoria-claves.json') : '';
+const RITMO_ARCHIVO   = ESTADO_DIR ? path.join(ESTADO_DIR, 'ritmo.json') : '';
+
+/** Señal para el bucle del workflow (un archivo pequeño en ESTADO). Best-effort. */
+function senal(nombre, valor) {
+  if (!ESTADO_DIR) return;
+  try { fs.mkdirSync(ESTADO_DIR, { recursive: true }); fs.writeFileSync(path.join(ESTADO_DIR, nombre), String(valor)); } catch { /* best-effort */ }
+}
+function leerJson(archivo) {
+  try { return archivo && fs.existsSync(archivo) ? JSON.parse(fs.readFileSync(archivo, 'utf8')) : null; } catch { return null; }
+}
+function escribirJson(archivo, valor) {
+  if (!archivo) return;
+  try { fs.mkdirSync(path.dirname(archivo), { recursive: true }); fs.writeFileSync(archivo, JSON.stringify(valor)); } catch { /* best-effort */ }
+}
+
+// Memoria por clave (MAYÚSCULAS): { t: última lectura OK (ms), n: lecturas seguidas sin cambio,
+// d: { nrc: disponibles }, f: ['periodo|nrc' que faltaron en la última lectura],
+// m: menor disponible leído, s: secciones listadas }.
+const memoria = new Map();
+(() => {
+  const j = leerJson(MEMORIA_ARCHIVO);
+  if (j && j.v === 1 && j.claves && typeof j.claves === 'object') {
+    for (const [k, v] of Object.entries(j.claves)) if (v && typeof v === 'object') memoria.set(k, v);
+  }
+})();
+// Claves de este turno (para no guardar memoria ajena).
+let clavesDelTurno = null;
+function guardarMemoria() {
+  if (!MEMORIA_ARCHIVO) return;
+  const limite = Date.now() - 4 * 24 * 3_600_000;
+  const claves = {};
+  for (const [k, v] of memoria) {
+    if ((v.t || 0) < limite) continue;
+    if (clavesDelTurno && !clavesDelTurno.has(k)) continue;
+    claves[k] = v;
+  }
+  escribirJson(MEMORIA_ARCHIVO, { v: 1, guardado: Date.now(), claves });
+}
+let ritmo = ritmoInicial(leerJson(RITMO_ARCHIVO), { tope: RITMO_TOPE, arranque: RITMO_ARRANQUE });
+function guardarRitmo() { escribirJson(RITMO_ARCHIVO, { nivel: ritmo.nivel, t: Date.now() }); }
+// Contadores del proceso (los lee también la salida ordenada por SIGTERM).
+const cuenta = { ok: 0, intentadas: 0, frenos: 0, bloqueos: 0, codigos: {} };
+function resumenCodigos() {
+  const nombre = (c) => (c === '0' ? 'sin respuesta' : c);
+  return Object.entries(cuenta.codigos).sort((a, b) => b[1] - a[1]).slice(0, 4)
+    .map(([c, n]) => `${nombre(c)}×${n}`).join(' ');
+}
+function resumenRitmo() {
+  const n = NIVELES[ritmo.nivel];
+  const frenos = cuenta.frenos + cuenta.bloqueos;
+  return `ritmo ${ritmo.nivel} (${n.conc} a la vez, ${(n.gapMin / 1000).toFixed(1)}–${(n.gapMax / 1000).toFixed(1)} s)` +
+    ` · ok ${cuenta.ok}/${cuenta.intentadas}` + (frenos ? ` · frenos ${frenos} (${resumenCodigos()})` : '');
+}
+// La UASD sirvió su propia página de veto a la salida directa (lo ve testProxy).
+let vetoDirecto = null;
 
 // (2026-11-10, Runner) PUENTE sin claves: en GitHub Actions el ETL no lleva la clave de
 // servicio. Se identifica con el token OIDC que GitHub firma para cada ejecución y la
@@ -206,6 +284,8 @@ async function revisarDemanda(clavePorNorm, forzar = false) {
       const clave = clavePorNorm.get(normalizeClave(row && typeof row === 'object' ? row.clave : row));
       if (!clave) continue; // no es de este turno (o ya no está en el universo)
       if (ahora - (demandaAtendida.get(clave) || 0) < 60_000) continue;
+      // Leída bien hace menos de 2 min (p. ej. sin secciones, que no escribe nada): ya está fresca.
+      if (ahora - (memoria.get(clave.toUpperCase())?.t || 0) < 120_000) continue;
       demandaAtendida.set(clave, ahora);
       colaDemanda.push(clave);
     }
@@ -286,9 +366,14 @@ let hbId = null, hbBroken = false;
 async function hbStart(extra = {}) {
   try {
     const ip = await getPublicIP();
+    // (2026-11-21) El turno va en el nombre («turno 2/3 · GitHub Actions …»): el doctor ve la
+    // salud de cada parte del catálogo. GitHub pisa RUNNER_NAME con el nombre de la máquina.
+    const etiqueta = SHARD_TOTAL > 1
+      ? `turno ${SHARD_INDEX + 1}/${SHARD_TOTAL} · ${RUNNER_NAME || 'sin nombre'}`
+      : (RUNNER_NAME || null);
     const { data, error } = await supabase
       .from('etl_runs')
-      .insert({ mode: ETL_MODE, runner: RUNNER_NAME || null, status: 'running', public_ip: ip, ...extra })
+      .insert({ mode: ETL_MODE, runner: etiqueta, status: 'running', public_ip: ip, ...extra })
       .select('id')
       .single();
     if (error) throw error;
@@ -359,10 +444,10 @@ async function hasClearance(context) {
 
 // Bloqueo DURO de Cloudflare (WAF/1020): la IP está en penalización temporal.
 // NO se resuelve recargando; martillar solo alarga el castigo → hay que rendirse.
+// (2026-11-21) También el veto PROPIO de la UASD («UASD · 403 Prohibido por el servidor»):
+// antes no se reconocía, el ETL lo daba por «Cloudflare superado» y se relanzaba cada 35 s.
 function isHardBlock(t) {
-  const s = (t || '').toLowerCase();
-  return s.includes('access denied') || s.includes('acceso denegado') ||
-         s.includes('restrict access') || s.includes('1020');
+  return esBloqueoDuro(t);
 }
 
 // Si CF pide un Turnstile INTERACTIVO ("Verifica que eres un humano" con
@@ -421,6 +506,9 @@ async function openPage(context, maxAttempts = 3) {
         await sleep(2500);
         lastTitle = await page.title().catch(() => '');
       }
+
+      // Veto del servidor (la página carga, pero es la de «403 Prohibido»): no es un éxito.
+      if (isHardBlock(lastTitle)) throw new Error(`IP_BLOQUEADA::${lastTitle}`);
 
       // Éxito REAL: el título ya NO es página de bloqueo/challenge de Cloudflare.
       if (!looksBlocked(lastTitle)) {
@@ -486,12 +574,15 @@ async function pageXHR(page, method, body = {}, attempt = 1) {
 // ── Re-resolver Cloudflare sobre una página existente (recarga hasta pasar) ────
 async function recoverPage(page) {
   for (let a = 1; a <= 3; a++) {
+    let t = '';
     try {
       await page.goto(UASD_PAGE, { waitUntil: 'domcontentloaded', timeout: 90_000 });
       await sleep(2500);
-      const t = await page.title().catch(() => '');
-      if (!looksBlocked(t)) return true;
+      t = await page.title().catch(() => '');
     } catch { /* reintenta */ }
+    // Veto del servidor: recargar solo lo alarga. Se corta el ciclo (lo recoge main.catch).
+    if (isHardBlock(t)) throw new Error(`IP_BLOQUEADA::${t}`);
+    if (t && !looksBlocked(t)) return true;
     await sleep(2000 * a + jitter());
   }
   return false;
@@ -505,19 +596,28 @@ async function recoverPage(page) {
 //   { clave, ok:false, blocked:true }      → Cloudflare re-desafió (HTML/403)
 //   { clave, ok:false, rateLimited:true }  → nos frenaron incluso tras reintentos
 //   { clave, ok:false, status/err }        → otro fallo
+// (2026-11-21) UN intento por consulta y un freno de emergencia. Antes cada clave frenada se
+// reintentaba hasta 4 veces dentro del lote (y luego 3 rondas más): con la UASD frenando, cada
+// lote de 40 tardaba 6 min golpeándola sin parar. Ahora: un 429/5xx o una consulta sin respuesta
+// se anota (con su Retry-After) y, a los `frenoTope` frenos seguidos, el lote se detiene y el
+// control de ritmo (ritmo.mjs) decide la pausa y el escalón. Además el lote dura como mucho
+// `loteMs`: lo que no alcanzó a pedirse vuelve a la cola (`sinIntentar`), así la demanda de los
+// estudiantes entra pronto aunque el ritmo sea lento.
 async function fetchBatch(page, claves, opts) {
-  return await page.evaluate(async ({ claves, conc, gapMin, gapMax, timeout, tries }) => {
+  return await page.evaluate(async ({ claves, conc, gapMin, gapMax, timeout, hasta, frenoTope }) => {
     const out = [];
     const nap = (ms) => new Promise(r => setTimeout(r, ms));
     let i = 0;
+    let seguidos = 0;
+    const parar = () => Date.now() >= hasta || seguidos >= frenoTope;
 
     async function fetchOne(clave) {
-      for (let attempt = 1; attempt <= tries; attempt++) {
-        await nap(gapMin + Math.random() * (gapMax - gapMin));
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), timeout);
+        let res, text;
         try {
-          const ctrl = new AbortController();
-          const to = setTimeout(() => ctrl.abort(), timeout);
-          const res = await fetch('Default.aspx/getData', {
+          res = await fetch('Default.aspx/getData', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json; charset=UTF-8',
@@ -527,39 +627,46 @@ async function fetchBatch(page, claves, opts) {
             body: JSON.stringify({ campus: '000', clave }),
             signal: ctrl.signal,
           });
-          clearTimeout(to);
-          const text = await res.text();
-          const isHtml = text.trimStart().startsWith('<');
+          text = await res.text();
+        } finally { clearTimeout(to); }
+        const isHtml = text.trimStart().startsWith('<');
 
-          if (res.status === 200 && !isHtml) {
-            return { clave, ok: true, rows: JSON.parse(JSON.parse(text).d) };
-          }
-          // Nos frenaron (rate-limit / servidor ocupado) → esperar y reintentar.
-          if (res.status === 429 || res.status === 503 || res.status === 502 || res.status === 500) {
-            if (attempt < tries) { await nap(1500 * Math.pow(2, attempt) + Math.random() * 1000); continue; }
-            return { clave, ok: false, rateLimited: true, status: res.status };
-          }
-          // Cloudflare re-desafió (página HTML) o 403 → no seguir martillando.
-          if (isHtml || res.status === 403) return { clave, ok: false, blocked: true, status: res.status };
-          // Otro código: un reintento suave.
-          if (attempt < tries) { await nap(800 * attempt); continue; }
-          return { clave, ok: false, status: res.status };
-        } catch (e) {
-          if (attempt < tries) { await nap(800 * attempt); continue; }
-          return { clave, ok: false, err: String((e && e.message) || e) };
+        if (res.status === 200 && !isHtml) {
+          let rows;
+          try { rows = JSON.parse(JSON.parse(text).d); } catch { return { clave, ok: false, status: 200, err: 'respuesta ilegible' }; }
+          seguidos = 0;
+          return { clave, ok: true, rows };
         }
+        // Nos frenaron (rate-limit / servidor ocupado): se anota y decide el control de ritmo.
+        if (res.status === 429 || res.status >= 500) {
+          seguidos++;
+          return { clave, ok: false, rateLimited: true, status: res.status, retryAfter: Number(res.headers.get('retry-after')) || 0 };
+        }
+        // Cloudflare re-desafió (página HTML) o 403 → no seguir martillando.
+        if (isHtml || res.status === 403) { seguidos++; return { clave, ok: false, blocked: true, status: res.status }; }
+        return { clave, ok: false, status: res.status };
+      } catch (e) {
+        // Sin respuesta a tiempo: la UASD está saturada o nos frena. Cuenta como freno.
+        seguidos++;
+        return { clave, ok: false, rateLimited: true, status: 0, err: String((e && e.message) || e).slice(0, 80) };
       }
     }
 
     async function worker() {
-      while (i < claves.length) { out.push(await fetchOne(claves[i++])); }
+      while (i < claves.length && !parar()) {
+        // Pausa ANTES de cada consulta (también la primera del lote), como siempre: así el ritmo
+        // se respeta también entre un lote y el siguiente.
+        await nap(gapMin + Math.random() * (gapMax - gapMin));
+        if (i >= claves.length || parar()) break;
+        out.push(await fetchOne(claves[i++]));
+      }
     }
     await Promise.all(Array.from({ length: Math.min(conc, claves.length) }, worker));
-    return out;
+    return { out, sinIntentar: claves.slice(i) };
   }, {
     claves,
     conc: opts.conc, gapMin: opts.gapMin, gapMax: opts.gapMax,
-    timeout: XHR_TIMEOUT, tries: opts.tries,
+    timeout: XHR_TIMEOUT, hasta: Date.now() + opts.loteMs, frenoTope: opts.frenoTope,
   });
 }
 
@@ -588,8 +695,9 @@ function mapRow(r) {
   };
 }
 
+// Devuelve true si TODO quedó guardado (si no, el turno no da esas materias por leídas).
 async function upsertRows(rows) {
-  if (!rows.length) return;
+  if (!rows.length) return true;
   // De-duplicar por la MISMA clave de conflicto (periodo,nrc) antes de mandar. La
   // API de la UASD a veces devuelve la misma sección (NRC) dos veces; si dos filas
   // con igual (periodo,nrc) caen en un mismo upsert, Postgres tira
@@ -601,12 +709,14 @@ async function upsertRows(rows) {
   const deduped = [...byKey.values()];
 
   const BATCH = 500;
+  let todo = true;
   for (let i = 0; i < deduped.length; i += BATCH) {
     const { error } = await supabase
       .from('cupos_oficiales')
       .upsert(deduped.slice(i, i + BATCH), { onConflict: 'periodo,nrc', ignoreDuplicates: false });
-    if (error) console.error('   ❌ upsert:', error.message);
+    if (error) { todo = false; console.error('   ❌ upsert:', error.message); }
   }
+  return todo;
 }
 
 // ── Reconciliación: CIERRA las secciones que la UASD dejó de listar ─────────────
@@ -626,9 +736,16 @@ async function upsertRows(rows) {
 //     muestran cupo (las de riesgo), y un upsert únicamente de las que hay que
 //     cerrar (normalmente pocas). Auto-sana: si la UASD la omitió por un glitch,
 //     el próximo ciclo la vuelve a listar y la reabre.
-async function cerrarSeccionesDesaparecidas(scrapedByClave) {
+//   · (2026-11-21) DOBLE CONFIRMACIÓN con `memoriaClaves`: la UASD a veces devuelve la materia
+//     sin las secciones de algún campus (respuesta a medias) y eso cerraba secciones que se
+//     reabrían 11 s después: ~31.000 cierres falsos al día entre el 12 y el 16-nov (cupos que
+//     «se llenaban» y «se liberaban» solos, escrituras y eventos de más). Ahora una sección se
+//     cierra solo si falta DOS lecturas seguidas. Sin memoria (carril PRO), como siempre.
+// Devuelve { cerradas, porClave: Map(clave → { cerradas: ['periodo|nrc'], pendientes: [...] }) }.
+async function cerrarSeccionesDesaparecidas(scrapedByClave, memoriaClaves = null) {
   const claves = [...scrapedByClave.keys()];
-  if (!claves.length) return 0;
+  const porClave = new Map();
+  if (!claves.length) return { cerradas: 0, porClave };
 
   const vivas = [];
   const IN = 200;
@@ -643,17 +760,36 @@ async function cerrarSeccionesDesaparecidas(scrapedByClave) {
   }
 
   const now = new Date().toISOString();
-  const cerrar = [];
+  // Solo las columnas de cupo → el UPDATE del upsert conserva horario, profesor,
+  // asignatura, etc. (estas filas YA existen, así que siempre entra por UPDATE).
+  const filaCerrada = (v) => {
+    const cupos = parseInt(v.cupos ?? '0', 10) || 0;
+    return { periodo: v.periodo, nrc: v.nrc, clave: v.clave, cupos, inscritos: cupos, disponibles: 0, scraped_at: now };
+  };
+  const faltanPorClave = new Map();
   for (const v of vivas) {
-    const set = scrapedByClave.get(String(v.clave || '').toUpperCase());
+    const claveUp = String(v.clave || '').toUpperCase();
+    const set = scrapedByClave.get(claveUp);
     if (set && !set.has(String(v.nrc || '').trim())) {
-      const cupos = parseInt(v.cupos ?? '0', 10) || 0;
-      // Solo las columnas de cupo → el UPDATE del upsert conserva horario, profesor,
-      // asignatura, etc. (estas filas YA existen, así que siempre entra por UPDATE).
-      cerrar.push({ periodo: v.periodo, nrc: v.nrc, clave: v.clave, cupos, inscritos: cupos, disponibles: 0, scraped_at: now });
+      if (!faltanPorClave.has(claveUp)) faltanPorClave.set(claveUp, []);
+      faltanPorClave.get(claveUp).push({ k: `${v.periodo}|${String(v.nrc || '').trim()}`, v });
     }
   }
-  if (!cerrar.length) return 0;
+  const cerrar = [];
+  for (const claveUp of claves) {
+    const faltan = faltanPorClave.get(claveUp) || [];
+    if (!memoriaClaves) {
+      for (const { v } of faltan) cerrar.push(filaCerrada(v));
+      porClave.set(claveUp, { cerradas: faltan.map((x) => x.k), pendientes: [] });
+      continue;
+    }
+    const antes = new Set(memoriaClaves.get(claveUp)?.f || []);
+    const { cerrar: confirmadas, pendientes } = confirmarFaltantes(antes, faltan.map((x) => x.k));
+    const ok = new Set(confirmadas);
+    for (const { k, v } of faltan) if (ok.has(k)) cerrar.push(filaCerrada(v));
+    porClave.set(claveUp, { cerradas: confirmadas, pendientes });
+  }
+  if (!cerrar.length) return { cerradas: 0, porClave };
 
   const BATCH = 500;
   for (let i = 0; i < cerrar.length; i += BATCH) {
@@ -662,7 +798,7 @@ async function cerrarSeccionesDesaparecidas(scrapedByClave) {
       .upsert(cerrar.slice(i, i + BATCH), { onConflict: 'periodo,nrc', ignoreDuplicates: false });
     if (error) console.warn('   ⚠ reconciliación upsert:', error.message);
   }
-  return cerrar.length;
+  return { cerradas: cerrar.length, porClave };
 }
 
 // ── Estado por clave: { minDisp, ageH, isDue } ────────────────────────────────
@@ -685,11 +821,13 @@ async function getClaveState() {
     for (const r of data) {
       const clave = String(r.clave || '').trim().toUpperCase();
       if (!clave) continue;
+      const ageH = Number(r.age_hours) || 0;
       map.set(clave, {
         minDisp: parseInt(r.min_disp ?? '0', 10) || 0,
-        ageH: Number(r.age_hours) || 0,
+        ageH,
         isDue: !!r.is_due,
         nSecc: parseInt(r.n_secciones ?? '0', 10) || 0,
+        leidaMs: Date.now() - ageH * 3_600_000,
       });
     }
     if (data.length < page) break;
@@ -721,7 +859,7 @@ async function getClaveState() {
   const now = Date.now();
   for (const [clave, v] of raw) {
     const ageH = (now - v.latest) / 3600_000;
-    map.set(clave, { minDisp: v.minDisp, ageH, isDue: ageH >= refreshBudgetHours(v.minDisp), nSecc: v.nSecc });
+    map.set(clave, { minDisp: v.minDisp, ageH, isDue: ageH >= refreshBudgetHours(v.minDisp), nSecc: v.nSecc, leidaMs: v.latest });
   }
   return map;
 }
@@ -760,6 +898,31 @@ function overdueScore(st) {
   return st.ageH / budget;
 }
 
+// (2026-11-21) Vencimiento ADAPTATIVO del modo priority. Mismo presupuesto por cupos de
+// siempre como base, pero lo que no cambia se relee cada vez menos (×2 por lectura igual, con
+// techo de edad: vigiladas 6 min, apretadas 30 min, bajando 2 h, holgadas 8 h, sin secciones
+// 24 h) y vuelve a la base apenas cambia. Antes cada materia pendiente se releía ~40 veces por
+// ciclo aunque no se moviera (900.000 lecturas al día): la UASD empezó a frenarnos el 16-nov.
+// Las vigiladas por el agente ya no entran «siempre»: base de 1,5 min y techo de 6 min.
+function vencimiento(claveUp, state, ahora) {
+  const st = state.get(claveUp);
+  const mem = memoria.get(claveUp);
+  const leidaMs = Math.max(st?.leidaMs || 0, mem?.t || 0);
+  if (!leidaMs) return { vencida: true, atraso: Number.POSITIVE_INFINITY, faltaMs: 0, nueva: true };
+  const fija = PINNED_KEYS.has(normalizeClave(claveUp));
+  const minDisp = st ? st.minDisp : (Number.isFinite(mem?.m) ? mem.m : 999);
+  const nSecc = st ? st.nSecc : (Number.isFinite(mem?.s) ? mem.s : 0);
+  const base = fija ? Math.min(refreshBudgetHours(minDisp), 0.025) : refreshBudgetHours(minDisp);
+  const intervalo = intervaloHoras({ base, minDisp, fija, sinCambios: mem?.n || 0, nSecc });
+  const edadH = Math.max(0, (ahora - leidaMs) / 3_600_000);
+  return {
+    vencida: edadH >= intervalo,
+    atraso: edadH / intervalo,
+    faltaMs: Math.max(0, (intervalo - edadH) * 3_600_000),
+    fija, minDisp,
+  };
+}
+
 // ── Selección + ORDEN de claves a extraer según ETL_MODE ──────────────────────
 function selectTargets(claves, state) {
   console.log(`   En BD: ${state.size} claves con data previa.`);
@@ -786,26 +949,28 @@ function selectTargets(claves, state) {
   }
 
   // priority INTELIGENTE: cada clave vence según su presupuesto (a menos cupos,
-  // más seguido; is_due lo calcula la función SQL). Las de cupos de sobra rara vez
-  // entran → cola de último. Las nuevas (aún no en BD) siempre entran.
+  // más seguido) y según cuánto cambia (ver `vencimiento`). Las de cupos de sobra rara vez
+  // entran → cola de último. Las nunca leídas entran de primeras.
   let nuevas = 0; const t = { fijas: 0, criticas: 0, calientes: 0, templadas: 0, holgadas: 0 };
+  const ahora = Date.now();
+  const venc = new Map();
   const targets = claves.filter(c => {
-    const normalized = normalizeClave(c);
-    const st = state.get(c.toUpperCase());
-    if (PINNED_KEYS.has(normalized)) { t.fijas++; return true; } // vigilancia dirigida → siempre
-    if (!st) { nuevas++; return true; }        // nueva → siempre
-    if (!st.isDue) return false;               // aún fresca para su nivel de cupos
-    if (st.minDisp <= 3) t.criticas++;
-    else if (st.minDisp <= 8) t.calientes++;
-    else if (st.minDisp <= 15) t.templadas++;
+    const v = vencimiento(c.toUpperCase(), state, ahora);
+    venc.set(c, v);
+    if (!v.vencida) return false;              // aún fresca para su nivel de cupos y de cambio
+    if (v.nueva) nuevas++;
+    else if (v.fija) t.fijas++;
+    else if (v.minDisp <= 3) t.criticas++;
+    else if (v.minDisp <= 8) t.calientes++;
+    else if (v.minDisp <= 15) t.templadas++;
     else t.holgadas++;
     return true;
   }).sort((a, b) => {
-    // Las fijadas van primero para que ni un corte por presupuesto las deje fuera.
-    const ap = PINNED_KEYS.has(normalizeClave(a));
-    const bp = PINNED_KEYS.has(normalizeClave(b));
-    if (ap !== bp) return ap ? -1 : 1;
-    return byUrgency(a, b);
+    // Las fijadas vencidas van primero para que ni un corte por presupuesto las deje fuera.
+    const va = venc.get(a), vb = venc.get(b);
+    if (!!va.fija !== !!vb.fija) return va.fija ? -1 : 1;
+    const d = vb.atraso - va.atraso;            // lo más atrasado respecto a SU intervalo, primero
+    return Number.isNaN(d) ? 0 : d;
   });
   console.log(`   Modo priority inteligente → ${targets.length} claves | fijas:${t.fijas} criticas:${t.criticas} calientes:${t.calientes} templadas:${t.templadas} holgadas:${t.holgadas} nuevas:${nuevas} · omitidas ${claves.length - targets.length} frescas.`);
   return targets;
@@ -827,7 +992,10 @@ function selectTargets(claves, state) {
 //   2) Luego bloques de [N fijadas (rotando) + 1 regular] → las Pro se revisitan
 //      varias veces por corrida mientras el catálogo general sigue avanzando.
 // `PRO_LANE_RATIO` ajusta N (0 = desactivado, comportamiento histórico).
-const PRO_LANE_RATIO = Math.max(0, Math.min(8, Number(process.env.PRO_LANE_RATIO ?? 2)));
+// (2026-11-21) APAGADO por defecto: cada revisita ES una consulta más a la UASD (2.170
+// consultas por pasada para 746 materias, medido el 21-nov). Las vigiladas ya se releen
+// solas cada 1,5–6 min con `vencimiento`, sin repetirlas en la cola.
+const PRO_LANE_RATIO = Math.max(0, Math.min(8, Number(process.env.PRO_LANE_RATIO ?? 0)));
 let fastLaneOffset = 0;
 function buildPriorityFastLane(targets) {
   if (PRO_LANE_RATIO === 0 || ETL_MODE !== 'priority' || targets.length === 0) return targets;
@@ -876,7 +1044,7 @@ const CLEAN_PROFILE_AFTER_STREAK = Math.max(1, Number(process.env.CLEAN_PROFILE_
 async function cloudflareCooldown(currentIp) {
   if (IGNORE_COOLDOWN) return null;
   try {
-    const { data, error } = await supabase
+    let consulta = supabase
       .from('etl_runs')
       .select('started_at, finished_at, status, public_ip')
       .order('started_at', { ascending: false })
@@ -884,6 +1052,10 @@ async function cloudflareCooldown(currentIp) {
       // que con una racha larga las filas `blocked` quedan lejos. Con 12 se
       // perdían de vista y el breaker atacaba creyendo que no había racha.
       .limit(40);
+    // (2026-11-21) Solo las corridas de ESTA IP: con tres turnos en paralelo, las filas sanas de
+    // los otros cortaban la racha y el breaker nunca se activaba (570 intentos en un turno vetado).
+    if (currentIp) consulta = consulta.eq('public_ip', currentIp);
+    const { data, error } = await consulta;
     if (error || !Array.isArray(data)) return null;
 
     let streak = 0, lastAttempt = null, lastBlockedIp = null;
@@ -918,7 +1090,7 @@ async function cloudflareCooldown(currentIp) {
     // el flag de Cloudflare. Insistir no acorta el castigo: lo alarga. Con la
     // racha alta conviene callarse 25-45 min y volver con la reputación limpia.
     // (Si el usuario cambia de IP —hotspot/router— el caso de arriba ataca ya.)
-    const waitMin = [0, 3, 8, 15, 25, 35, 45][Math.min(streak, 6)];
+    const waitMin = descansoMin(streak);
     const elapsedMin = (Date.now() - Date.parse(lastAttempt)) / 60_000;
     // Recuperación tras un corte largo (WiFi caído, PC dormida): si el último
     // intento es MUY viejo, la racha es historia de antes del corte → no
@@ -998,6 +1170,8 @@ async function testProxy(proxyStr, budgetMs = 22_000) {
     let t = await pg.title().catch(() => '');
     const hasta = Date.now() + 20_000;
     while (looksBlocked(t) && !isHardBlock(t) && Date.now() < hasta) { await sleep(2500); t = await pg.title().catch(() => ''); }
+    // La salida directa recibió el veto propio de la UASD: lo anota main() para pedir otra máquina.
+    if (!proxyStr && isHardBlock(t)) vetoDirecto = { titulo: t };
     return !looksBlocked(t) && !isHardBlock(t);
   } catch { return false; }
   finally { try { if (b) await withTimeout(b.close(), 8000, 'close'); } catch {} }
@@ -1165,12 +1339,12 @@ async function persistProSnapshot(clave, rawRows) {
   const previousNrcs = proHunterLastNrcs.get(key);
   let cerradas = 0;
   if (!sameStringSet(previousNrcs, currentNrcs)) {
-    cerradas = await withTimeout(
+    cerradas = (await withTimeout(
         cerrarSeccionesDesaparecidas(new Map([[key, currentNrcs]])),
         20_000,
         'PRO_DB_RECONCILE_TIMEOUT'
       )
-      .catch((e) => { throw new Error(`PRO_DB::${e?.message || e}`); });
+      .catch((e) => { throw new Error(`PRO_DB::${e?.message || e}`); })).cerradas;
     proHunterLastNrcs.set(key, currentNrcs);
   }
   return { rows: rows.length, cerradas };
@@ -1301,7 +1475,16 @@ async function main() {
   console.log('══════════════════════════════════════════\n');
 
   const myIp = await getPublicIP();
-  console.log(`   IP pública de salida: ${myIp || 'desconocida'}`);
+  console.log(`   IP pública de salida: ${myIp || 'desconocida'} · ${resumenRitmo()}`);
+  // Lecturas buenas que este turno ya hizo desde esta IP en ciclos anteriores (las cuenta el
+  // bucle del workflow). Con 0, un veto es de la IP (venía vetada): se pide otra máquina.
+  const lecturasTurno = Math.max(0, Number(process.env.ETL_LECTURAS_TURNO || 0) || 0);
+  const puedeReemplazar = process.env.ETL_PUEDE_REEMPLAZAR === '1';
+
+  // ── Enfriamiento anti-bloqueo IP-AWARE (ANTES de tocar la UASD) ───────────
+  // (2026-11-21) Primero, sin tocar la UASD: si ESTA IP está descansando, ni la prueba directa.
+  // Con proxy activo, la IP de salida es la del proxy: el enfriamiento de la IP de la casa no aplica.
+  let cd = activeProxy ? null : await cloudflareCooldown(myIp);
 
   // ── Cazador de proxy gratis (si está activado y no hay proxy fijo) ─────────
   // Si encuentra uno que pase Cloudflare, la salida ya NO es la IP bloqueada de
@@ -1310,22 +1493,32 @@ async function main() {
     // (2026-11-10, Runner) Primero la salida DIRECTA: medido en GitHub Actions, la IP del
     // runner pasa Cloudflare y es más rápida y fiable que cualquier proxy gratis. El proxy
     // solo entra si la directa queda bloqueada.
-    if (await testProxy(null, 25_000)) {
-      console.log('   ✓ La salida directa pasa Cloudflare: sin proxy en este ciclo.');
-    } else {
+    let directa = false;
+    if (!cd) {
+      directa = await testProxy(null, 25_000);
+      if (directa) console.log('   ✓ La salida directa pasa Cloudflare: sin proxy en este ciclo.');
+      else if (vetoDirecto && lecturasTurno === 0 && puedeReemplazar) {
+        // La UASD veta esta IP desde el primer contacto (no la quemamos nosotros): insistir no
+        // sirve y un proxy gratis rara vez pasa. El turno pide otra máquina de GitHub (otra IP).
+        console.warn(`::warning::La UASD veta la IP ${myIp || '?'} desde el primer contacto («${vetoDirecto.titulo}»): se pide una máquina nueva.`);
+        senal('veto-ip', myIp || '?');
+        await hbStart();
+        await hbEnd('blocked', { detail: `IP vetada por la UASD desde el primer contacto («${vetoDirecto.titulo}»); se pide otra máquina` });
+        return;
+      }
+    }
+    if (!directa) {
       const found = await huntWorkingProxy(Number(process.env.PROXY_HUNT_MIN || 6));
-      if (found) { activeProxy = found; console.log(`   → Usando proxy gratis: ${activeProxy}`); }
+      if (found) { activeProxy = found; cd = null; console.log(`   → Usando proxy gratis: ${activeProxy}`); }
     }
   }
 
-  // ── Enfriamiento anti-bloqueo IP-AWARE (ANTES de tocar la UASD) ───────────
-  // Con proxy activo, la IP de salida es la del proxy: el enfriamiento de la IP
-  // de la casa no aplica.
-  const cd = activeProxy ? null : await cloudflareCooldown(myIp);
   if (cd) {
     console.warn(`::notice::Cloudflare lleva ${cd.streak} bloqueo(s) seguido(s) en ESTA MISMA IP (${myIp || '?'}); ` +
       `dejándola descansar (${cd.waitMin} min entre intentos, faltan ~${cd.remainingMin.toFixed(0)} min). ` +
       `Apenas cambie la IP (hotspot/router) el sistema ataca de una. Este ciclo NO toca la UASD.`);
+    // El bucle del turno duerme lo que falta del descanso (antes volvía a los 20 s).
+    senal('espera-s', Math.max(60, Math.ceil(cd.remainingMin * 60)));
     await hbStart();
     await hbEnd('cooling', { detail: `racha de ${cd.streak} bloqueos CF en IP ${myIp || '?'}; próximo intento en ~${cd.remainingMin.toFixed(0)} min (o inmediato si cambia la IP)` });
     return;
@@ -1390,75 +1583,120 @@ async function main() {
   }
 
   // ── 2b. Filtrado por modo (eficiencia) ────────────────────────────────────
-  // state es MUTABLE: el bucle de re-priorización (priority) lo re-lee en cada
-  // pasada para saber qué volvió a vencer. runList lo referencia por clausura.
+  // state es MUTABLE. (2026-11-21) En priority se re-lee de la base cada ESTADO_CADA_MS
+  // (10 min, 1 RPC agregada) y, entre medias, el turno lo lleva él mismo con lo que lee:
+  // solo este turno escribe sus claves. Antes se releía en CADA pasada.
+  clavesDelTurno = new Set(claves.map((c) => c.toUpperCase()));
   let state = await getClaveState();
+  let estadoLeidoEn = Date.now();
+  let vigiladasLeidasEn = Date.now();
   // En priority, suma las claves vigiladas del equipo (best-effort) para que su
   // proyección entre siempre en el ciclo. En full/stale/delta no hace falta.
   if (ETL_MODE === 'priority') await loadDynamicPinnedKeys();
 
-  // ── 3. getData — motor educado con backoff adaptativo y reintentos ──────────
-  const PROFILE_MAIN   = {
-    // El general conserva EXACTAMENTE su concurrencia histórica. El recurso
-    // adicional vive en runProHunter(), nunca se presta a la cola Free.
-    conc: FETCH_CONC,
-    gapMin: GAP_MIN,
-    gapMax: GAP_MAX,
-    tries: 4,
-  };
-  // Perfil suave para reintentos: más lento aún, para vencer el rate-limit.
-  const PROFILE_GENTLE = { conc: 1, gapMin: GAP_MIN * 2, gapMax: GAP_MAX * 2, tries: 5 };
-
-  let totalRows = 0, okCount = 0, seccionesNuevas = 0, processedTotal = 0, stoppedByDeadline = false;
+  // ── 3. getData — ritmo que se adapta a la UASD (ritmo.mjs) ─────────────────
+  let totalRows = 0, seccionesNuevas = 0, processedTotal = 0, stoppedByDeadline = false;
   let totalCerradas = 0, errors = 0, lastTargets = 0;
+  let ultimaRecuperacion = 0;
 
-  // Procesa una lista de claves; devuelve las que quedaron SIN datos (para reintentar).
-  async function runList(list, opts, label) {
+  const perfilActual = () => ({ ...NIVELES[ritmo.nivel], loteMs: LOTE_MAX_MS, frenoTope: FRENO_SEGUIDOS });
+  // Techo duro de un lote: su ventana + la última consulta en vuelo + margen. Un page.evaluate
+  // sobre un navegador zombie NUNCA resuelve; con este límite se relanza Chromium.
+  const techoLoteMs = () => Math.min(BATCH_HARD_TIMEOUT, LOTE_MAX_MS + XHR_TIMEOUT + 30_000);
+
+  // Duerme sin pasarse del presupuesto del ciclo. Devuelve lo que NO alcanzó a dormir.
+  async function pausar(ms, motivo) {
+    const cabe = Math.max(0, (minutesLeft() - 1.5) * 60_000);
+    const aqui = Math.min(ms, cabe);
+    if (aqui > 0) {
+      await hbBeat({ detail: `pausa de ${Math.round(aqui / 1000)} s: ${motivo} · ${resumenRitmo()}` });
+      await sleep(aqui);
+    }
+    return ms - aqui;
+  }
+
+  // Lo que se aprende de una lectura buena: ¿cambió? (memoria) y el estado local de la clave.
+  function aprender(claveUp, unicos, info, ahora) {
+    const mem = memoria.get(claveUp) || {};
+    const nrcDe = (k) => k.slice(k.lastIndexOf('|') + 1);
+    const pendientes = info?.pendientes || [];
+    const cerradas = info?.cerradas || [];
+    const { cambio, mapa } = compararLectura(mem.d || null, unicos, pendientes.map(nrcDe));
+    for (const k of cerradas) delete mapa[nrcDe(k)];
+    const periodo = periodoDominante(unicos);
+    const delPeriodo = periodo ? unicos.filter((u) => u.periodo === periodo) : unicos;
+    const prev = state.get(claveUp);
+    // Secciones vigentes que la base conoce: si la UASD lista menos, las demás están llenas
+    // (ocultas) o pendientes de confirmar → la materia cuenta como llena (caza de cupos).
+    const nSecc = Math.max(prev?.nSecc || 0, delPeriodo.length);
+    let minDisp = delPeriodo.length ? Math.min(...delPeriodo.map((u) => u.disponibles)) : 999;
+    if (nSecc > delPeriodo.length || cerradas.length) minDisp = 0;
+    if (!nSecc) minDisp = 999;
+    memoria.set(claveUp, {
+      t: ahora,
+      n: cambio || cerradas.length ? 0 : (Number(mem.n) || 0) + 1,
+      d: mapa,
+      f: pendientes,
+      m: minDisp,
+      s: nSecc,
+    });
+    state.set(claveUp, { ...(prev || {}), minDisp, nSecc, leidaMs: ahora, ageH: 0, isDue: false });
+  }
+
+  // Procesa una lista de claves; devuelve las que quedaron SIN datos y cuántos frenos hubo.
+  async function runList(list, label) {
     const failed = [];
+    const cola = [...list];
     let processed = 0;
-    for (let b = 0; b < list.length; b += BATCH_SIZE) {
+    let frenosLista = 0;
+    while (cola.length) {
       // PRESUPUESTO: si se agotó el tiempo, corta ORDENADO. Lo urgente ya se
       // procesó (la cola va por atraso); el resto entra en el próximo ciclo.
-      // Mil veces mejor que dejar que el timeout del job mate el run a mitad
-      // de un upsert y tapone la cola de concurrencia por horas.
       if (minutesLeft() <= 1) {
         stoppedByDeadline = true;
-        console.warn(`\n   ⏱ Presupuesto de ${DEADLINE_MIN} min agotado en [${label}]: corte ordenado con ${processed}/${list.length} procesadas.`);
+        console.warn(`\n   ⏱ Presupuesto de ${DEADLINE_MIN} min agotado en [${label}]: corte ordenado con ${processed} consultas (${cola.length} siguen en cola).`);
         break;
       }
-      const batch = list.slice(b, b + BATCH_SIZE);
+      const batch = cola.splice(0, BATCH_SIZE);
+      const perfil = perfilActual();
       let res;
       try {
-        // withTimeout: un page.evaluate sobre un browser zombie NUNCA resuelve;
-        // sin este límite, un solo cuelgue se comía el timeout completo del job.
-        res = await withTimeout(fetchBatch(masterPage, batch, opts), BATCH_HARD_TIMEOUT, 'LOTE_COLGADO');
+        res = await withTimeout(fetchBatch(masterPage, batch, perfil), techoLoteMs(), 'LOTE_COLGADO');
       } catch (e) {
+        if (/IP_BLOQUEADA/.test(String(e?.message))) throw e;
         if (isDeadBrowserError(e.message)) {
           await hardRecover(e.message);
         } else {
           console.warn(`\n   ⚠ lote falló (${e.message}); re-resolviendo Cloudflare…`);
-          const ok = await recoverPage(masterPage).catch(() => false);
+          const ok = await recoverPage(masterPage);   // lanza IP_BLOQUEADA si es el veto
           if (!ok) await hardRecover('recoverPage agotado');
         }
-        res = await withTimeout(fetchBatch(masterPage, batch, opts), BATCH_HARD_TIMEOUT, 'LOTE_COLGADO')
-          .catch(() => batch.map(c => ({ clave: c, ok: false, rateLimited: true })));
+        ultimaRecuperacion = Date.now();
+        res = await withTimeout(fetchBatch(masterPage, batch, perfil), techoLoteMs(), 'LOTE_COLGADO')
+          .catch(() => ({ out: [], sinIntentar: batch }));
       }
+      const out = Array.isArray(res?.out) ? res.out : [];
+      const sinIntentar = Array.isArray(res?.sinIntentar) ? res.sinIntentar : [];
 
       const toUpsert = [];
       // clave (UPPER) → Set<nrc> que la UASD lista AHORA. Solo claves scrapeadas OK.
       // Con secciones → base para cerrar las que desaparecieron; con lista VACÍA →
-      // Set vacío (materia 100% llena: hay que cerrar TODAS sus secciones).
+      // Set vacío (materia 100% llena: hay que cerrar TODAS sus secciones, confirmado dos veces).
       const scrapedByClave = new Map();
-      let limitedInBatch = 0, blockedInBatch = 0;
-      for (const r of res) {
+      const leidas = new Map();
+      const lote = { intentadas: out.length, ok: 0, frenos: 0, bloqueos: 0, retryAfterS: 0 };
+      for (const r of out) {
         if (r.ok) {
-          okCount++;
+          lote.ok++;
           const claveUp = (r.clave || '').toUpperCase();
-          if (Array.isArray(r.rows) && r.rows.length) {
-            const mapped = r.rows.map(mapRow).filter(x => x.periodo && x.nrc);
-            const unicos = Array.from(new Map(mapped.map(it => [it.nrc, it])).values());
+          const filas = Array.isArray(r.rows) ? r.rows : [];
+          const mapped = filas.map(mapRow).filter(x => x.periodo && x.nrc);
+          const unicos = Array.from(new Map(mapped.map(it => [it.nrc, it])).values());
+          if (!claveUp) continue;
+          if (unicos.length) {
             toUpsert.push(...unicos);
-            if (unicos.length && claveUp) scrapedByClave.set(claveUp, new Set(unicos.map(u => u.nrc)));
+            scrapedByClave.set(claveUp, new Set(unicos.map(u => u.nrc)));
+            leidas.set(claveUp, unicos);
             // Detección de SECCIONES NUEVAS: si trae más secciones que las que había.
             const prevN = state.get(claveUp)?.nSecc ?? unicos.length;
             if (unicos.length > prevN) {
@@ -1466,51 +1704,83 @@ async function main() {
               seccionesNuevas += delta;
               console.log(`\n   ✨ ${r.clave}: +${delta} sección(es) nueva(s) (${prevN}→${unicos.length}).`);
             }
-          } else if (claveUp && Array.isArray(r.rows) && r.rows.length === 0) {
-            // OK y la UASD devolvió lista VACÍA → la materia ya no lista NINGUNA
-            // sección (todas llenas). Set vacío → cerrarSeccionesDesaparecidas cierra
-            // TODAS las secciones que la BD aún muestra con cupo. Mata el cupo fantasma
-            // del caso "materia 100% llena", que antes quedaba SIN reconciliar (la fila
-            // se congelaba con su último disponibles positivo para siempre).
+          } else if (filas.length === 0) {
+            // OK y la UASD devolvió lista VACÍA → la materia ya no lista NINGUNA sección.
             scrapedByClave.set(claveUp, new Set());
+            leidas.set(claveUp, []);
           }
+          // (filas sin periodo/nrc = respuesta rara: ni se reconcilia ni se da por leída)
         } else {
           failed.push(r.clave);
-          if (r.rateLimited) limitedInBatch++;
-          if (r.blocked) blockedInBatch++;
+          if (r.rateLimited) lote.frenos++;
+          if (r.blocked) lote.bloqueos++;
+          if (r.retryAfter) lote.retryAfterS = Math.max(lote.retryAfterS, r.retryAfter);
+          const cod = String(r.status ?? '?');
+          cuenta.codigos[cod] = (cuenta.codigos[cod] || 0) + 1;
         }
       }
-      if (toUpsert.length) { await upsertRows(toUpsert); totalRows += toUpsert.length; }
-      // Cierra las secciones que la UASD dejó de listar (llenas) → mata los cupos
-      // fantasma que reportaban los estudiantes. Solo toca claves scrapeadas OK.
+      cuenta.ok += lote.ok; cuenta.intentadas += lote.intentadas;
+      cuenta.frenos += lote.frenos; cuenta.bloqueos += lote.bloqueos;
+      frenosLista += lote.frenos + lote.bloqueos;
+
+      const guardado = await upsertRows(toUpsert);
+      if (toUpsert.length) totalRows += toUpsert.length;
+      // Cierra las secciones que la UASD dejó de listar DOS lecturas seguidas (llenas).
+      let porClave = new Map();
       if (scrapedByClave.size) {
-        const cerradas = await cerrarSeccionesDesaparecidas(scrapedByClave);
-        if (cerradas) { totalCerradas += cerradas; console.log(`\n   🔒 ${cerradas} sección(es) cerrada(s) (ya no listadas por la UASD).`); }
+        const rec = await cerrarSeccionesDesaparecidas(scrapedByClave, memoria);
+        porClave = rec.porClave;
+        if (rec.cerradas) { totalCerradas += rec.cerradas; console.log(`\n   🔒 ${rec.cerradas} sección(es) cerrada(s) (faltaron dos lecturas seguidas).`); }
       }
-      processed += batch.length;
-      processedTotal += batch.length;
-      process.stdout.write(`\r   [${label}] ${processed}/${list.length} | filas:${totalRows} | ok:${okCount} | pendientes:${failed.length}   `);
+      // Si la base no guardó, esas materias no cuentan como leídas: siguen vencidas.
+      if (guardado) {
+        const ahora = Date.now();
+        for (const [claveUp, unicos] of leidas) aprender(claveUp, unicos, porClave.get(claveUp), ahora);
+      }
+      processed += out.length;
+      processedTotal += out.length;
+      process.stdout.write(`\r   [${label}] ${processed}/${list.length} | filas:${totalRows} | ok:${cuenta.ok} | pendientes:${failed.length} | ritmo:${ritmo.nivel}   `);
       // Latido por lote: el watchdog externo distingue "trabajando" de "colgado".
       await hbBeat({ procesadas: processedTotal, filas: totalRows, secciones_nuevas: seccionesNuevas });
 
-      // ADAPTATIVO: si CF re-desafió, re-resolver; si nos frenaron, enfriar.
-      if (blockedInBatch > batch.length * 0.3) {
-        console.warn(`\n   ⚠ Cloudflare re-desafió; re-resolviendo…`);
-        await recoverPage(masterPage);
-      } else if (limitedInBatch > batch.length * 0.3) {
-        const cool = 8000 + Math.random() * 4000;
-        console.warn(`\n   ⏸ La UASD nos frenó (${limitedInBatch}/${batch.length}); enfriando ${(cool / 1000).toFixed(0)}s…`);
-        await sleep(cool);
+      // RITMO (AIMD): la UASD decide cuánto aguanta. Un freno baja el escalón y pausa.
+      const antes = ritmo.nivel;
+      const ajuste = ajustarRitmo(ritmo, lote, { tope: RITMO_TOPE });
+      ritmo = ajuste.ritmo;
+      if (ritmo.nivel !== antes) {
+        console.log(`\n   Ritmo ${antes} → ${ritmo.nivel} · ${resumenRitmo()} · lote: ${lote.ok}/${lote.intentadas} bien, ${lote.frenos} frenos, ${lote.bloqueos} bloqueos.`);
       }
 
-      // Carril de demanda: lo que los estudiantes acaban de abrir entra justo después de este lote.
-      if (await revisarDemanda(clavePorNorm)) {
-        const pedidas = tomarDemanda();
-        list.splice(b + BATCH_SIZE, 0, ...pedidas);
+      // Cloudflare re-desafió: re-resolver (como mucho una vez cada 3 min; el veto corta el ciclo).
+      if (lote.bloqueos > Math.max(1, out.length * 0.3) && Date.now() - ultimaRecuperacion > 3 * 60_000) {
+        console.warn(`\n   ⚠ Cloudflare re-desafió (${lote.bloqueos}/${out.length}); re-resolviendo…`);
+        ultimaRecuperacion = Date.now();
+        const ok = await recoverPage(masterPage);
+        if (!ok) await hardRecover('recoverPage agotado');
+      }
+
+      // Carril de demanda: lo que los estudiantes acaban de abrir entra primero; luego lo que
+      // no alcanzó a pedirse en este lote; luego el resto de la cola.
+      const pedidas = (await revisarDemanda(clavePorNorm)) ? tomarDemanda() : [];
+      if (pedidas.length) {
         console.log(`\n   👀 Demanda: ${pedidas.length} materia(s) que están consultando entran al frente (${pedidas.join(', ')}).`);
+        const pedidasSet = new Set(pedidas);   // sin leerlas dos veces en la misma pasada
+        for (let k = cola.length - 1; k >= 0; k--) if (pedidasSet.has(cola[k])) cola.splice(k, 1);
+      }
+      cola.unshift(...pedidas, ...sinIntentar.filter((c) => !pedidas.includes(c)));
+
+      // Pausa que pide el control de ritmo. Si no cabe en el ciclo, la completa el bucle del turno.
+      if (ajuste.pausaMs > 0) {
+        console.warn(`\n   ⏸ La UASD nos frenó (${lote.frenos + lote.bloqueos}/${Math.max(1, lote.intentadas)}): pausa de ${Math.round(ajuste.pausaMs / 1000)} s, ritmo ${ritmo.nivel}.`);
+        const resta = await pausar(ajuste.pausaMs, 'freno de la UASD');
+        if (resta > 0) {
+          senal('espera-s', Math.ceil(resta / 1000));
+          stoppedByDeadline = true;
+          break;
+        }
       }
     }
-    return failed;
+    return { failed, frenos: frenosLista };
   }
 
   // ── 3b. Reconciliación por UNIVERSO — cierra claves que la UASD ya no lista ──
@@ -1529,7 +1799,7 @@ async function main() {
         const ghosts = new Map();
         for (const claveUp of state.keys()) if (!universeUpper.has(claveUp)) ghosts.set(claveUp, new Set());
         if (ghosts.size) {
-          const cerradasGhost = await cerrarSeccionesDesaparecidas(ghosts);
+          const { cerradas: cerradasGhost } = await cerrarSeccionesDesaparecidas(ghosts);
           if (cerradasGhost) {
             totalCerradas += cerradasGhost;
             console.log(`   🔒 ${cerradasGhost} sección(es) cerrada(s) de ${ghosts.size} clave(s) fuera del universo (la UASD ya no las lista).`);
@@ -1541,13 +1811,10 @@ async function main() {
     } catch (e) { console.warn('   ⚠ reconciliación por universo:', e?.message || e); }
   }
 
-  // ── Bucle de RE-PRIORIZACIÓN CONTINUA (pico de selección) ───────────────────
-  // En priority, mientras quede presupuesto, RE-EVALÚA la urgencia y vuelve a pasar
-  // sobre lo más crítico (su presupuesto corto lo deja "vencido" de nuevo en
-  // minutos), reusando el MISMO navegador caliente → una sola resolución de
-  // Cloudflare por corrida (mejor reputación de IP, no peor). MISMA tasa de
-  // peticiones que hoy (conc/gaps intactos): solo reparte el mismo caudal hacia lo
-  // crítico. full/stale/delta = UNA sola pasada (idéntico al comportamiento previo).
+  // ── Bucle de RE-PRIORIZACIÓN CONTINUA ──────────────────────────────────────
+  // En priority, mientras quede presupuesto, vuelve a mirar qué venció (según cupos y según
+  // cuánto cambia cada materia) y lo pide, con el MISMO navegador caliente → una sola
+  // resolución de Cloudflare por corrida. full/stale/delta = UNA sola pasada.
   const LOOP_MARGIN_MIN = 3;   // aire para cerrar navegador + refrescar búsqueda al final
   // El bucle continuo SOLO aplica a priority CON presupuesto finito (el workflow
   // pone ETL_DEADLINE_MIN=50). Sin deadline (corrida local, DEADLINE_MIN=0)
@@ -1556,11 +1823,17 @@ async function main() {
   let pass = 0;
   while (true) {
     pass++;
-    if (pass > 1) {
-      // Re-lee el estado (1 RPC agregada, barata) para saber qué volvió a vencer:
-      // lo recién scrapeado ya no está due, y lo que envejeció sube al frente.
-      state = await getClaveState();
-      if (ETL_MODE === 'priority') await loadDynamicPinnedKeys();
+    if (pass > 1 && ETL_MODE === 'priority') {
+      // La verdad de la base cada 10 min (1 RPC agregada); entre medias, la cuenta propia.
+      if (Date.now() - estadoLeidoEn >= ESTADO_CADA_MS) {
+        const fresco = await getClaveState();
+        if (fresco.size) state = fresco;   // si la base no respondió, se sigue con la cuenta propia
+        estadoLeidoEn = Date.now();
+      }
+      if (Date.now() - vigiladasLeidasEn >= ESTADO_CADA_MS) {
+        await loadDynamicPinnedKeys();
+        vigiladasLeidasEn = Date.now();
+      }
     }
     // Lo que los estudiantes están consultando va primero en la pasada.
     await revisarDemanda(clavePorNorm, true);
@@ -1571,20 +1844,18 @@ async function main() {
     if (pedidasPase.length) console.log(`   👀 Demanda: ${pedidasPase.length} materia(s) consultadas al frente de la pasada.`);
     lastTargets = selectedTargets.length;
     if (!selectedTargets.length) {
-      // Nada vencido ahora mismo: en priority espera corta y re-evalúa (sin spin,
-      // manteniendo el navegador caliente); en los demás modos, no hay nada → salir.
+      // Nada vencido ahora mismo: en priority espera y re-evalúa (sin spin, manteniendo el
+      // navegador caliente); en los demás modos, no hay nada → salir.
       if (LOOP_ENABLED && minutesLeft() > LOOP_MARGIN_MIN) {
-        // Espera hasta que la PRÓXIMA clave de este turno vence (45 s – 10 min), en vez de
-        // releer el estado completo cada 45 s: lo mismo de fresco, mucha menos salida de Supabase.
+        // Espera hasta que la PRÓXIMA clave de este turno vence (45 s – 10 min).
+        const ahora = Date.now();
         let proximaMs = 600_000;
         for (const c of claves) {
-          const st = state.get(c.toUpperCase());
-          if (!st) continue;
-          const faltaMs = (refreshBudgetHours(st.minDisp) - st.ageH) * 3_600_000;
-          if (faltaMs < proximaMs) proximaMs = faltaMs;
+          const falta = vencimiento(c.toUpperCase(), state, ahora).faltaMs;
+          if (falta < proximaMs) proximaMs = falta;
         }
-        const esperaMs = Math.max(45_000, Math.min(600_000, Math.round(proximaMs)), 0);
-        await hbBeat({ detail: `pasada ${pass}: nada vencido; espera ${Math.round(esperaMs / 1000)} s` });
+        const esperaMs = Math.max(45_000, Math.min(600_000, Math.round(proximaMs)));
+        await hbBeat({ detail: `pasada ${pass}: nada vencido; espera ${Math.round(esperaMs / 1000)} s · ${resumenRitmo()}` });
         // El reposo se interrumpe si un estudiante consulta una materia de este turno.
         const despiertaEn = Date.now() + Math.min(esperaMs, Math.max(45_000, (minutesLeft() - LOOP_MARGIN_MIN) * 60_000));
         while (Date.now() < despiertaEn) {
@@ -1596,20 +1867,19 @@ async function main() {
       break;
     }
     const targets = buildPriorityFastLane(selectedTargets);
-    await hbBeat({ targets: selectedTargets.length, scheduled: targets.length });
-    console.log(`3. getData · pasada ${pass} (${targets.length} consultas · ${selectedTargets.length} claves elegibles · conc=${PROFILE_MAIN.conc} · gap=${GAP_MIN}-${GAP_MAX}ms · lote=${BATCH_SIZE})…`);
+    await hbBeat({ targets: selectedTargets.length });
+    console.log(`3. getData · pasada ${pass} (${targets.length} consultas · ${selectedTargets.length} claves elegibles · ${resumenRitmo()} · lote ≤${BATCH_SIZE} y ≤${Math.round(LOTE_MAX_MS / 1000)} s)…`);
 
-    // Pasada + hasta 3 rondas de reintento cada vez más suaves.
-    let pending = await runList(targets, PROFILE_MAIN, `p${pass}`);
-    for (let round = 1; round <= 3 && pending.length && !stoppedByDeadline && minutesLeft() > 8; round++) {
-      console.log(`\n   ↻ Ronda ${round}: reintentando ${pending.length} claves más despacio…`);
+    // Pasada + hasta 2 rondas de reintento SOLO si los fallos fueron sueltos: con la UASD
+    // frenando, insistir es lo que la hace frenar más (incidente del 16 al 21-nov).
+    let { failed: pending, frenos } = await runList(targets, `p${pass}`);
+    for (let round = 1; round <= 2 && pending.length && !frenos && !stoppedByDeadline && minutesLeft() > 8; round++) {
+      console.log(`\n   ↻ Ronda ${round}: reintentando ${pending.length} claves (fallos sueltos, sin freno de la UASD)…`);
       await sleep(6000);
-      const ok = await recoverPage(masterPage).catch(() => false);
-      if (!ok) await hardRecover('recoverPage agotado pre-reintento');
-      pending = await runList(pending, PROFILE_GENTLE, `p${pass}r${round}`);
+      ({ failed: pending, frenos } = await runList(pending, `p${pass}r${round}`));
     }
     errors = new Set(pending.map(normalizeClave)).size;
-    console.log(`\n   ✓ getData pasada ${pass} ${stoppedByDeadline ? 'CORTADA por presupuesto' : 'completa'}. Sin datos: ${errors}`);
+    console.log(`\n   ✓ getData pasada ${pass} ${stoppedByDeadline ? 'CORTADA por presupuesto' : 'completa'}. Sin datos: ${errors} · ${resumenRitmo()}`);
 
     // Cierra fantasmas fuera del universo cada pasada (barato; tras limpiar, no-op).
     await reconcileUniverse();
@@ -1618,6 +1888,9 @@ async function main() {
     // presupuesto: repetir mientras quede tiempo y no nos hayan cortado.
     if (!LOOP_ENABLED) break;
     if (stoppedByDeadline || minutesLeft() <= LOOP_MARGIN_MIN) break;
+    // Lo aprendido se guarda a cada pasada: si el proceso muere, el próximo ciclo no parte de cero.
+    guardarMemoria();
+    guardarRitmo();
     await hbBeat({ procesadas: processedTotal, filas: totalRows, secciones_nuevas: seccionesNuevas });
   }
 
@@ -1639,13 +1912,20 @@ async function main() {
   console.log(`══════════════════════════════════════════\n`);
 
   const tooManyMissing = lastTargets > 0 && errors > lastTargets * 0.3;
-  const status = stoppedByDeadline ? 'partial' : (tooManyMissing ? 'degraded' : 'ok');
+  // (2026-11-21) «degraded» también si la UASD frenó más de la mitad de lo pedido: así el doctor
+  // lo ve aunque el ciclo haya terminado por tiempo (antes salía «partial», como si nada).
+  const frenada = cuenta.intentadas >= 10 && cuenta.ok < cuenta.intentadas * 0.5;
+  const status = (tooManyMissing && !stoppedByDeadline) || frenada ? 'degraded' : (stoppedByDeadline ? 'partial' : 'ok');
+  guardarMemoria();
+  guardarRitmo();
+  senal('lecturas-ok', cuenta.ok);
   await hbEnd(status, {
     targets: lastTargets, procesadas: processedTotal, filas: totalRows,
     secciones_nuevas: seccionesNuevas, sin_datos: errors,
-    detail: stoppedByDeadline
+    detail: (stoppedByDeadline
       ? `corte ordenado a los ${DEADLINE_MIN} min; lo pendiente sigue en cola por urgencia`
-      : (ETL_MODE === 'priority' ? `${pass} pasada(s) de re-priorización continua` : null),
+      : (ETL_MODE === 'priority' ? `${pass} pasada(s) de re-priorización continua` : 'pasada completa'))
+      + ` · ${resumenRitmo()}`,
   });
 
   // Falla el job SOLO si quedó mucho sin traer (problema real), no por rezagados
@@ -1656,13 +1936,35 @@ async function main() {
   }
 }
 
+// (2026-11-21) Salida ORDENADA si el turno corta el proceso (timeout del ciclo o fin del job):
+// guarda lo aprendido y cierra su fila en etl_runs en vez de dejarla «huérfana» o en «error»
+// (el barrido completo moría así cada día desde el 17-nov: «headed browser without XServer»).
+let saliendo = false;
+async function salidaOrdenada(motivo) {
+  if (saliendo) return;
+  saliendo = true;
+  try { guardarMemoria(); guardarRitmo(); senal('lecturas-ok', cuenta.ok); } catch { /* best-effort */ }
+  await withTimeout(hbEnd('partial', { detail: `cortado por ${motivo} (fin del ciclo o del turno) · ${resumenRitmo()}` }), 5_000, 'hb').catch(() => {});
+  process.exit(0);
+}
+process.once('SIGTERM', () => { salidaOrdenada('SIGTERM'); });
+process.once('SIGINT', () => { salidaOrdenada('SIGINT'); });
+
 main().catch(async (e) => {
   const msg = String((e && e.message) || e);
   await stopProHunter();
   await closeBrowserSafe();   // sin Chromium huérfano comiéndose la RAM del nodo
+  try { guardarMemoria(); guardarRitmo(); senal('lecturas-ok', cuenta.ok); } catch { /* best-effort */ }
   // Bloqueo/freno temporal de Cloudflare NO es un bug: es condición transitoria de
   // la UASD. Salimos en VERDE (exit 0) con aviso; el próximo ciclo reintenta solo.
-  if (/IP_BLOQUEADA|No se pudo pasar Cloudflare|rate-limit|penalizaci|access denied/i.test(msg)) {
+  // (2026-11-21) Incluye el 403 del veto de la UASD: antes salía «error» y el breaker no lo veía.
+  if (esErrorDeBloqueo(msg)) {
+    const titulo = msg.includes('IP_BLOQUEADA::') ? msg.slice(msg.indexOf('IP_BLOQUEADA::') + 14) : '';
+    const sinLecturas = (Math.max(0, Number(process.env.ETL_LECTURAS_TURNO || 0) || 0) + cuenta.ok) === 0;
+    // Veto desde el primer contacto (esta IP venía vetada): el turno pide otra máquina.
+    if (process.env.ETL_PUEDE_REEMPLAZAR === '1' && sinLecturas && (esBloqueoDuro(titulo) || /HTTP 403/.test(msg))) {
+      senal('veto-ip', (await getPublicIP().catch(() => null)) || '?');
+    }
     console.warn(`\n::warning::La UASD bloqueó/frenó temporalmente la IP. No se scrapeó este ciclo; se reintenta en el próximo. (${msg.slice(0, 120)})`);
     await hbEnd('blocked', { detail: msg.slice(0, 500) });
     process.exit(0);

@@ -17,6 +17,11 @@
 #     el workflow en la pestaña Actions).
 #   · Cortés con la UASD: 3 consultas a la vez, pausas de 0,4–0,9 s, lotes de 40
 #     (parámetros del ETL de siempre). Nada de ráfagas.
+#   · (2026-11-21) Tras el freno de la UASD del 16 al 21-nov: el ritmo se adapta solo (baja
+#     al primer freno, sube tras lotes sanos; ver cupos/ritmo.mjs), cada materia se relee según
+#     cuánto cambia, un ciclo fallido espera cada vez más (nunca más cada 20 s), y una IP que la
+#     UASD veta desde el primer contacto pide otra máquina (job «Pedir otra máquina»).
+#     El barrido «full» diario queda solo a mano: el modo priority relee todo con techo de edad.
 #   · Cloudflare: perfil de Chromium y proxies que ya pasaron se guardan entre
 #     turnos (caché); si la salida directa está bloqueada, el ETL busca un proxy
 #     público que pase (ver cupos/proxies.mjs).
@@ -45,6 +50,14 @@ on:
       horas:
         description: 'Duración del turno en horas (máx. 5.6)'
         default: '5.6'
+      turno:
+        description: 'todos = las tres partes del catálogo · 0/1/2 = solo esa parte (máquina de reemplazo)'
+        type: choice
+        default: todos
+        options: [todos, '0', '1', '2']
+      reemplazo:
+        description: 'Cuántas máquinas de reemplazo lleva esta parte (lo pone el propio turno)'
+        default: '0'
 
 permissions:
   contents: read
@@ -52,8 +65,10 @@ permissions:
   # así este repo público no guarda ninguna clave.
   id-token: write
 
+# Una máquina de reemplazo (turno 0/1/2) corre en su propio grupo: entra al momento, mientras
+# las otras dos partes del turno principal siguen trabajando.
 concurrency:
-  group: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[turno]') && 'cupos-uasd-diagnostico' || 'cupos-uasd' }}
+  group: ${{ (github.event_name == 'push' && !contains(github.event.head_commit.message, '[turno]') && 'cupos-uasd-diagnostico') || (contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && format('cupos-uasd-reemplazo-{0}', github.event.inputs.turno)) || 'cupos-uasd' }}
   cancel-in-progress: false
 
 jobs:
@@ -61,13 +76,18 @@ jobs:
     name: Turno de cupos ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    # actions: write solo lo usa el paso «Pedir otra máquina» (el token no llega al ETL).
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
     # Tres turnos en paralelo, cada uno en su propia máquina (su propia IP) con una
     # parte fija del catálogo: el triple de lecturas por minuto con la MISMA cortesía
-    # por IP (3 consultas a la vez, pausas de 0,4–0,9 s).
+    # por IP. Una máquina de reemplazo trae solo su parte.
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: ${{ fromJSON(contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && format('[{0}]', github.event.inputs.turno) || '[0, 1, 2]') }}
     defaults:
       run:
         working-directory: cupos
@@ -83,6 +103,8 @@ jobs:
       ETL_PUENTE: https://gntczowattweopbrasxs.supabase.co/functions/v1/etl-puente
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -143,16 +165,24 @@ jobs:
           echo "modo=$modo" >> "$GITHUB_OUTPUT"
           mkdir -p "$ESTADO"
 
+      # Cada cambio del scraper pasa primero las pruebas del cerebro del ETL (ritmo, cada cuánto
+      # releer, doble confirmación, veto). Sin red: unos segundos.
+      - name: Pruebas (sin red)
+        if: steps.plan.outputs.modo == 'diagnostico' && matrix.shard == 0
+        run: npm test
+
       - name: Diagnóstico (¿la UASD responde?)
         if: steps.plan.outputs.modo == 'diagnostico' && matrix.shard == 0
         timeout-minutes: 25
         run: xvfb-run -a node diagnostico.mjs
 
       - name: Turno
+        id: turno
         if: steps.plan.outputs.modo == 'turno' || steps.plan.outputs.modo == 'full'
         env:
           MODO: ${{ steps.plan.outputs.modo }}
           HORAS: ${{ github.event.inputs.horas || '5.6' }}
+          REEMPLAZO: ${{ github.event.inputs.reemplazo || '0' }}
           RUNNER_NAME: github-actions-${{ matrix.shard }}
           # Frescura: con tres turnos hay caudal para revisar cada materia el doble de seguido
           # (a menos cupos, más seguido; la escala de urgencia es la misma de siempre).
@@ -166,24 +196,57 @@ jobs:
           HOT_THRESHOLD: '10'
           ETL_PINNED_KEYS: 'LET1310'
           PRO_HUNTER_ENABLED: 'false'
+          # (2026-11-21) Ritmo: nunca más rápido que el escalón 1 (2 a la vez, 0,9–1,5 s); arranca
+          # en el que aprendió el ciclo anterior. Sin revisitas repetidas en la cola.
+          RITMO_TOPE: '1'
+          PRO_LANE_RATIO: '0'
         run: |
-          fin=$(( SECONDS + $(awk -v h="$HORAS" 'BEGIN{ if (h > 5.6) h = 5.6; printf "%d", h * 3600 }') ))
-          ciclo=0
+          # Lee un número de un archivo-señal del ETL (o el valor por defecto). Seguro con bash -e.
+          num() { local v=""; if [ -f "$1" ]; then v=$(tr -dc '0-9' < "$1" || true); fi; echo "${v:-$2}"; }
+          REEMPLAZO=${REEMPLAZO//[^0-9]/}; REEMPLAZO=${REEMPLAZO:-0}
+          fin=$(( SECONDS + $(awk -v h="$HORAS" 'BEGIN{ if (h > 5.6) h = 5.6; if (h < 0.2) h = 0.2; printf "%d", h * 3600 }') ))
+          ciclo=0; fallos=0; lecturas=0
           while :; do
             queda=$(( (fin - SECONDS) / 60 ))
             [ "$queda" -lt 8 ] && break
-            hoy=$(date -u +%F); hhmm=$(date -u +%H%M)
             modo=priority; deadline=$(( queda - 5 < 50 ? queda - 5 : 50 ))
+            # El barrido completo queda solo a mano (modo=full): el modo priority ya relee todo con
+            # techo de edad (holgadas ≤ 8 h, sin secciones ≤ 24 h) sin dejar la demanda sin atender.
             if [ "$MODO" = "full" ] && [ "$ciclo" -eq 0 ]; then
               modo=full; deadline=$(( queda - 5 < 240 ? queda - 5 : 240 ))
-            elif [ "$hhmm" -ge 0530 ] && [ ! -f "$ESTADO/full-$hoy" ] && [ "$queda" -ge 200 ]; then
-              modo=full; deadline=$(( queda - 5 < 240 ? queda - 5 : 240 )); touch "$ESTADO/full-$hoy"
             fi
             ciclo=$(( ciclo + 1 ))
-            echo "── Ciclo $ciclo · $modo · hasta $deadline min · $(date -u +%H:%M) UTC"
-            ETL_MODE=$modo ETL_DEADLINE_MIN=$deadline timeout $(( deadline * 60 + 240 )) xvfb-run -a node etl-cupos.mjs || echo "::warning::El ciclo $ciclo terminó con error; sigue el siguiente."
+            puede=0; if [ "$REEMPLAZO" -lt 3 ] && [ "$queda" -ge 25 ] && [ "$lecturas" -eq 0 ]; then puede=1; fi
+            echo "── Ciclo $ciclo · $modo · hasta $deadline min · $(date -u +%H:%M) UTC · lecturas buenas del turno: $lecturas"
+            rm -f "$ESTADO/espera-s" "$ESTADO/veto-ip" "$ESTADO/lecturas-ok"
+            inicio=$SECONDS
+            if ETL_MODE=$modo ETL_DEADLINE_MIN=$deadline ETL_LECTURAS_TURNO=$lecturas ETL_PUEDE_REEMPLAZAR=$puede \
+               timeout --kill-after=60 $(( deadline * 60 + 900 )) xvfb-run -a node etl-cupos.mjs; then
+              fallos=0
+            else
+              fallos=$(( fallos + 1 ))
+              echo "::warning::El ciclo $ciclo terminó con error ($fallos seguido(s))."
+            fi
+            lecturas=$(( lecturas + $(num "$ESTADO/lecturas-ok" 0) ))
             [ "$MODO" = "full" ] && break
-            sleep 20
+            # La UASD veta esta IP desde el primer contacto: otra máquina de GitHub (otra IP).
+            if [ -f "$ESTADO/veto-ip" ] && [ "$puede" = 1 ]; then
+              horas=$(awk -v s="$(( fin - SECONDS ))" 'BEGIN{ printf "%.2f", s / 3600 }')
+              echo "::warning::La UASD veta la IP $(cat "$ESTADO/veto-ip"): se pide otra máquina para la parte $ETL_SHARD ($horas h)."
+              { echo "reemplazo=si"; echo "horas=$horas"; } >> "$GITHUB_OUTPUT"
+              break
+            fi
+            # Espera antes del próximo ciclo: la que pide el ETL (descanso de la IP o freno de la
+            # UASD) o, si el ciclo falló rápido, un retroceso que se dobla: 1, 2, 4, 8, 16 min.
+            # Antes eran 20 s siempre: un turno vetado se relanzó 570 veces el 21-nov.
+            espera=$(num "$ESTADO/espera-s" 20)
+            if [ "$fallos" -gt 0 ] && [ $(( SECONDS - inicio )) -lt 300 ]; then
+              b=$(( 60 << (fallos > 5 ? 4 : fallos - 1) ))
+              [ "$b" -gt "$espera" ] && espera=$b
+            fi
+            tope=$(( fin - SECONDS - 480 ))
+            [ "$espera" -gt "$tope" ] && espera=$tope
+            if [ "$espera" -gt 0 ]; then echo "   Espera de $espera s antes del próximo ciclo."; sleep "$espera"; fi
           done
 
       - name: Guardar estado para el próximo turno
@@ -193,12 +256,32 @@ jobs:
           path: .estado
           key: estado-${{ matrix.shard }}-${{ github.run_id }}
 
+      # La UASD vetó esta IP antes de que leyéramos nada: una máquina nueva de GitHub trae otra IP
+      # y sigue esta misma parte del catálogo hasta el fin del turno (como mucho 3 por turno).
+      - name: Pedir otra máquina para esta parte (IP vetada)
+        if: ${{ !cancelled() && steps.turno.outputs.reemplazo == 'si' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARTE: ${{ matrix.shard }}
+          HORAS_TURNO: ${{ steps.turno.outputs.horas }}
+          REEMPLAZO: ${{ github.event.inputs.reemplazo || '0' }}
+        run: |
+          r=${REEMPLAZO//[^0-9]/}; siguiente=$(( ${r:-0} + 1 ))
+          for i in 1 2 3; do
+            gh workflow run cupos-uasd.yml -R "$GITHUB_REPOSITORY" --ref main -f modo=turno -f horas="$HORAS_TURNO" -f turno="$PARTE" -f reemplazo="$siguiente" \
+              && { echo "Máquina nueva pedida para la parte $PARTE (reemplazo $siguiente)."; exit 0; }
+            sleep $(( i * 15 ))
+          done
+          echo "::error::No se pudo pedir la máquina nueva: esta parte espera al próximo turno."
+          exit 1
+
   # El siguiente turno lo pide este mismo turno al terminar (bien o con error). Un turno
   # cancelado a mano no se releva. Un fallo espera 5 min antes de pedir (sin bucles rápidos).
   relevo:
     name: Relevo del turno
     needs: turno
-    if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.modo != 'diagnostico') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]'))) }}
+    # Una máquina de reemplazo no se releva: el relevo lo pide el turno principal.
+    if: ${{ !cancelled() && !contains(fromJSON('["0","1","2"]'), github.event.inputs.turno) && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.modo != 'diagnostico') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[turno]'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

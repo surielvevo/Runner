@@ -8,7 +8,13 @@ sin depender de ninguna computadora encendida.
 |---|---|
 | `etl-cupos.mjs` | El ETL de siempre (Playwright + Supabase): cola por urgencia (menos cupos primero), corte ordenado por tiempo, latido en `etl_runs`, freno ante Cloudflare. Origen: `scripts/etl-cupos.mjs` de CupoUASD. |
 | `proxies.mjs` | Pool de proxies públicos: varias fuentes, prefiltro de red en paralelo (¿abre túnel hasta `app.uasd.edu.do:443`?) y prueba con navegador real. Los que pasan se recuerdan entre turnos. |
-| `diagnostico.mjs` | Comprueba, sin escribir nada, si la UASD responde desde el runner (directo y por proxies). |
+| `diagnostico.mjs` | Comprueba, sin escribir nada, si la UASD responde desde el runner (directo y por proxies) y el código de una consulta de cupos. |
+| `ritmo.mjs` | (2026-11-21) El «cerebro»: ritmo AIMD que baja al primer freno de la UASD y sube tras lotes sanos, relectura según cuánto cambia cada materia (con techo de edad), doble confirmación antes de cerrar una sección y reconocimiento del veto de la UASD. Lógica pura: `npm test` (`pruebas/`). |
+
+**Lección del 16 al 21-nov-2026**: con ~900.000 lecturas al día la UASD empezó a frenar `getData` y a
+vetar algunas IP («403 Prohibido por el servidor»). El ETL reintentaba en ráfaga y un turno vetado se
+relanzaba cada 35 s. Ahora la UASD marca el ritmo, lo que no cambia se relee cada vez menos, un ciclo
+fallido espera cada vez más y una IP vetada desde el primer contacto pide otra máquina.
 
 ## Puesta en marcha (sin claves)
 Este repositorio público **no guarda ninguna clave**. Cada ejecución pide a GitHub un token de
