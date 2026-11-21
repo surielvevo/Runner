@@ -32,54 +32,79 @@ export const NIVEL_LENTO = NIVELES.length - 1;
 const LOTES_SANOS_PARA_SUBIR = 3;
 const PAUSA_BASE_MS = 30_000;
 const PAUSA_MAX_MS = 10 * 60_000;
-const RETRY_AFTER_MAX_MS = 15 * 60_000;
+// (2026-11-21) El 21-nov la UASD respondió 429 pidiendo ≥ 15 min: se respeta entero (hasta 1 h).
+const RETRY_AFTER_MAX_MS = 60 * 60_000;
 const RITMO_VIGENCIA_MS = 6 * 3_600_000;
+// Umbral aprendido (como el ssthresh de TCP): el escalón que provocó un castigo largo no se vuelve
+// a pisar en estas horas. Sin él, el ritmo subía, la UASD castigaba 15 min, bajaba… en bucle.
+const UMBRAL_HORAS = 6;
+const CASTIGO_LARGO_MS = 10 * 60_000;
 
 const entero = (v, d) => (Number.isInteger(v) ? v : d);
 const acotar = (v, min, max) => Math.min(max, Math.max(min, v));
+/** Escalón más rápido permitido ahora: el tope configurado o el umbral aprendido, el más lento. */
+const topeVigente = (r, t, ahora) =>
+  (Number.isInteger(r.umbral) && (Number(r.umbralHasta) || 0) > ahora) ? Math.max(t, r.umbral) : t;
 
 /** Ritmo con que arranca un ciclo: el aprendido en el anterior (si es reciente) o el prudente. */
-export function ritmoInicial(guardado, { tope = 1, arranque = 3, ahora = Date.now() } = {}) {
+export function ritmoInicial(guardado, { tope = 1, arranque = 4, ahora = Date.now() } = {}) {
   const t = acotar(entero(tope, 1), 0, NIVEL_LENTO);
-  let nivel = acotar(entero(arranque, 3), t, NIVEL_LENTO);
+  let nivel = acotar(entero(arranque, 4), t, NIVEL_LENTO);
+  let umbral = null, umbralHasta = 0;
+  if (guardado && Number.isInteger(guardado.umbral) && (Number(guardado.umbralHasta) || 0) > ahora) {
+    umbral = acotar(guardado.umbral, t, NIVEL_LENTO);
+    umbralHasta = Number(guardado.umbralHasta);
+  }
   if (guardado && Number.isInteger(guardado.nivel) && ahora - (Number(guardado.t) || 0) < RITMO_VIGENCIA_MS) {
     nivel = acotar(guardado.nivel, t, NIVEL_LENTO);
   }
-  return { nivel, buenos: 0, malos: 0 };
+  if (umbral !== null) nivel = Math.max(nivel, umbral);
+  return { nivel, buenos: 0, malos: 0, umbral, umbralHasta };
 }
 
 /**
  * Ajusta el ritmo tras un lote. `lote`: { intentadas, ok, frenos, bloqueos, retryAfterS }.
  *  · Freno (≥ 20 % de frenos/bloqueos, o 2+ en un lote cortito): baja 1 escalón (2 si casi
- *    todo vino frenado) y pausa 30 s, 60 s, 120 s… (máx. 10 min; respeta Retry-After).
- *  · Lote limpio: tras 3 seguidos sube 1 escalón, nunca por encima del tope.
+ *    todo vino frenado) y pausa 30 s, 60 s, 120 s… (máx. 10 min; respeta Retry-After, hasta 1 h).
+ *    Si el castigo es largo (Retry-After ≥ 10 min) o se repite, el escalón que lo provocó queda
+ *    vedado 6 h (umbral): no se vuelve a subir hasta él.
+ *  · Lote limpio: tras 3 seguidos sube 1 escalón, nunca por encima del tope ni del umbral.
  *  · Algo de ruido sin freno: se mantiene.
  */
-export function ajustarRitmo(r, lote, { tope = 1 } = {}) {
+export function ajustarRitmo(r, lote, { tope = 1, ahora = Date.now() } = {}) {
   const t = acotar(entero(tope, 1), 0, NIVEL_LENTO);
   const intentadas = Math.max(0, lote.intentadas | 0);
   const malas = Math.max(0, (lote.frenos | 0) + (lote.bloqueos | 0));
   const ok = Math.max(0, lote.ok | 0);
+  const vigente = topeVigente(r, t, ahora);
+  const umbral = vigente > t ? r.umbral : null;
+  const umbralHasta = umbral !== null ? r.umbralHasta : 0;
   const frenado = malas > 0 && (intentadas === 0 || malas / intentadas >= 0.2 || (intentadas < 5 && malas >= 2));
   if (frenado) {
     const salto = intentadas > 0 && malas / intentadas >= 0.8 ? 2 : 1;
     const malos = r.malos + 1;
     const pausa = Math.min(PAUSA_MAX_MS, PAUSA_BASE_MS * 2 ** Math.min(malos - 1, 10));
     const pide = Math.min(RETRY_AFTER_MAX_MS, Math.max(0, Number(lote.retryAfterS) || 0) * 1000);
+    const desde = Math.max(r.nivel, vigente);
+    let nuevoUmbral = umbral, nuevoHasta = umbralHasta;
+    if (pide >= CASTIGO_LARGO_MS || malos >= 2) {
+      nuevoUmbral = Math.min(NIVEL_LENTO, Math.max(umbral ?? t, desde + 1));
+      nuevoHasta = ahora + UMBRAL_HORAS * 3_600_000;
+    }
     return {
-      ritmo: { nivel: Math.min(NIVEL_LENTO, Math.max(r.nivel, t) + salto), buenos: 0, malos },
+      ritmo: { nivel: Math.min(NIVEL_LENTO, desde + salto), buenos: 0, malos, umbral: nuevoUmbral, umbralHasta: nuevoHasta },
       pausaMs: Math.max(pausa, pide),
       motivo: 'freno',
     };
   }
   if (intentadas > 0 && malas === 0 && ok === intentadas) {
     const buenos = r.buenos + 1;
-    if (buenos >= LOTES_SANOS_PARA_SUBIR && r.nivel > t) {
-      return { ritmo: { nivel: r.nivel - 1, buenos: 0, malos: 0 }, pausaMs: 0, motivo: 'sube' };
+    if (buenos >= LOTES_SANOS_PARA_SUBIR && r.nivel > vigente) {
+      return { ritmo: { nivel: r.nivel - 1, buenos: 0, malos: 0, umbral, umbralHasta }, pausaMs: 0, motivo: 'sube' };
     }
-    return { ritmo: { nivel: Math.max(r.nivel, t), buenos, malos: 0 }, pausaMs: 0, motivo: 'sano' };
+    return { ritmo: { nivel: Math.max(r.nivel, vigente), buenos, malos: 0, umbral, umbralHasta }, pausaMs: 0, motivo: 'sano' };
   }
-  return { ritmo: { nivel: Math.max(r.nivel, t), buenos: 0, malos: 0 }, pausaMs: 0, motivo: 'estable' };
+  return { ritmo: { nivel: Math.max(r.nivel, vigente), buenos: 0, malos: 0, umbral, umbralHasta }, pausaMs: 0, motivo: 'estable' };
 }
 
 // ── 2. Cada cuánto releer una materia ─────────────────────────────────────────

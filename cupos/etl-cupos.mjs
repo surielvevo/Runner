@@ -125,7 +125,7 @@ const IGNORE_COOLDOWN = process.env.ETL_IGNORE_COOLDOWN === 'true';
 // Ver ritmo.mjs. RITMO_TOPE = escalón más rápido permitido (0 = el ritmo de antes del
 // 16-nov, 1 = por defecto); RITMO_ARRANQUE = escalón con que arranca sin memoria.
 const RITMO_TOPE      = Math.max(0, Math.min(NIVELES.length - 1, parseInt(process.env.RITMO_TOPE ?? '1', 10) || 0));
-const RITMO_ARRANQUE  = Math.max(RITMO_TOPE, Math.min(NIVELES.length - 1, parseInt(process.env.RITMO_ARRANQUE ?? '3', 10) || 3));
+const RITMO_ARRANQUE  = Math.max(RITMO_TOPE, Math.min(NIVELES.length - 1, parseInt(process.env.RITMO_ARRANQUE ?? '4', 10) || 4));
 // Un lote nunca pasa de LOTE_MAX_MS: así un estudiante que abre una materia espera como
 // mucho eso a que su consulta entre, aunque el ritmo sea lento.
 const LOTE_MAX_MS     = Math.max(20_000, Number(process.env.LOTE_MAX_MS || 75_000));
@@ -177,7 +177,7 @@ function guardarMemoria() {
   escribirJson(MEMORIA_ARCHIVO, { v: 1, guardado: Date.now(), claves });
 }
 let ritmo = ritmoInicial(leerJson(RITMO_ARCHIVO), { tope: RITMO_TOPE, arranque: RITMO_ARRANQUE });
-function guardarRitmo() { escribirJson(RITMO_ARCHIVO, { nivel: ritmo.nivel, t: Date.now() }); }
+function guardarRitmo() { escribirJson(RITMO_ARCHIVO, { nivel: ritmo.nivel, t: Date.now(), umbral: ritmo.umbral ?? null, umbralHasta: ritmo.umbralHasta || 0 }); }
 // Contadores del proceso (los lee también la salida ordenada por SIGTERM).
 const cuenta = { ok: 0, intentadas: 0, frenos: 0, bloqueos: 0, codigos: {} };
 function resumenCodigos() {
@@ -189,7 +189,9 @@ function resumenRitmo() {
   const n = NIVELES[ritmo.nivel];
   const frenos = cuenta.frenos + cuenta.bloqueos;
   return `ritmo ${ritmo.nivel} (${n.conc} a la vez, ${(n.gapMin / 1000).toFixed(1)}–${(n.gapMax / 1000).toFixed(1)} s)` +
-    ` · ok ${cuenta.ok}/${cuenta.intentadas}` + (frenos ? ` · frenos ${frenos} (${resumenCodigos()})` : '');
+    ` · ok ${cuenta.ok}/${cuenta.intentadas}` + (frenos ? ` · frenos ${frenos} (${resumenCodigos()})` : '') +
+    (Number.isInteger(ritmo.umbral) && ritmo.umbralHasta > Date.now()
+      ? ` · umbral ${ritmo.umbral} hasta ${new Date(ritmo.umbralHasta).toISOString().slice(11, 16)} UTC` : '');
 }
 // La UASD sirvió su propia página de veto a la salida directa (lo ve testProxy).
 let vetoDirecto = null;
@@ -1745,7 +1747,7 @@ async function main() {
 
       // RITMO (AIMD): la UASD decide cuánto aguanta. Un freno baja el escalón y pausa.
       const antes = ritmo.nivel;
-      const ajuste = ajustarRitmo(ritmo, lote, { tope: RITMO_TOPE });
+      const ajuste = ajustarRitmo(ritmo, lote, { tope: RITMO_TOPE, ahora: Date.now() });
       ritmo = ajuste.ritmo;
       if (ritmo.nivel !== antes) {
         console.log(`\n   Ritmo ${antes} → ${ritmo.nivel} · ${resumenRitmo()} · lote: ${lote.ok}/${lote.intentadas} bien, ${lote.frenos} frenos, ${lote.bloqueos} bloqueos.`);
@@ -1771,7 +1773,7 @@ async function main() {
 
       // Pausa que pide el control de ritmo. Si no cabe en el ciclo, la completa el bucle del turno.
       if (ajuste.pausaMs > 0) {
-        console.warn(`\n   ⏸ La UASD nos frenó (${lote.frenos + lote.bloqueos}/${Math.max(1, lote.intentadas)}): pausa de ${Math.round(ajuste.pausaMs / 1000)} s, ritmo ${ritmo.nivel}.`);
+        console.warn(`\n   ⏸ La UASD nos frenó (${lote.frenos + lote.bloqueos}/${Math.max(1, lote.intentadas)}${lote.retryAfterS ? `, Retry-After ${lote.retryAfterS} s` : ''}): pausa de ${Math.round(ajuste.pausaMs / 1000)} s, ritmo ${ritmo.nivel}.`);
         const resta = await pausar(ajuste.pausaMs, 'freno de la UASD');
         if (resta > 0) {
           senal('espera-s', Math.ceil(resta / 1000));

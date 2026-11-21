@@ -9,11 +9,11 @@ import {
 const lote = (intentadas, ok, frenos = 0, bloqueos = 0, retryAfterS = 0) => ({ intentadas, ok, frenos, bloqueos, retryAfterS });
 
 test('arranca prudente sin memoria y respeta el ritmo aprendido reciente', () => {
-  assert.equal(ritmoInicial(null).nivel, 3);
+  assert.equal(ritmoInicial(null).nivel, 4);
   const ahora = 1_000_000_000_000;
   assert.equal(ritmoInicial({ nivel: 5, t: ahora - 60_000 }, { ahora }).nivel, 5);
   // Memoria de hace más de 6 h: se ignora.
-  assert.equal(ritmoInicial({ nivel: 6, t: ahora - 7 * 3_600_000 }, { ahora }).nivel, 3);
+  assert.equal(ritmoInicial({ nivel: 6, t: ahora - 7 * 3_600_000 }, { ahora }).nivel, 4);
   // Nunca más rápido que el tope.
   assert.equal(ritmoInicial({ nivel: 0, t: ahora }, { ahora, tope: 1 }).nivel, 1);
   assert.equal(ritmoInicial({ nivel: 0, t: ahora }, { ahora, tope: 0 }).nivel, 0);
@@ -37,10 +37,10 @@ test('el primer freno baja el ritmo y pausa; los siguientes doblan la pausa', ()
   assert.equal(a.pausaMs, 10 * 60_000);
 });
 
-test('respeta el Retry-After de la UASD (con tope de 15 min)', () => {
+test('respeta el Retry-After de la UASD (con tope de 1 h)', () => {
   const r = { nivel: 3, buenos: 0, malos: 0 };
   assert.equal(ajustarRitmo(r, lote(4, 0, 4, 0, 300)).pausaMs, 300_000);
-  assert.equal(ajustarRitmo(r, lote(4, 0, 4, 0, 99_999)).pausaMs, 15 * 60_000);
+  assert.equal(ajustarRitmo(r, lote(4, 0, 4, 0, 99_999)).pausaMs, 60 * 60_000);
 });
 
 test('un lote frenado sin ninguna consulta intentada también cuenta como freno', () => {
@@ -155,4 +155,41 @@ test('clasifica como bloqueo el 403 de getCampus (antes salía como error y se r
 
 test('escalera de descanso de una IP bloqueada', () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 9].map(descansoMin), [0, 3, 8, 15, 25, 35, 45, 45]);
+});
+
+test('umbral: el escalón que provocó un castigo largo queda vedado 6 h', () => {
+  const ahora = 1_000_000_000_000;
+  // En el escalón 3 la UASD castiga 15 min: baja a 4 y el 3 queda vedado.
+  let a = ajustarRitmo({ nivel: 3, buenos: 0, malos: 0 }, lote(6, 3, 3, 0, 900), { ahora });
+  assert.equal(a.ritmo.nivel, 4);
+  assert.equal(a.ritmo.umbral, 4);
+  assert.equal(a.pausaMs, 900_000);
+  // Muchos lotes limpios después: no vuelve al 3 mientras dure el umbral.
+  let r = a.ritmo;
+  for (let i = 0; i < 12; i++) r = ajustarRitmo(r, lote(10, 10), { ahora: ahora + 60_000 * i }).ritmo;
+  assert.equal(r.nivel, 4);
+  // Pasadas 6 h, puede volver a probar el 3 (y más rápido) con cuidado.
+  const despues = ahora + 7 * 3_600_000;
+  for (let i = 0; i < 3; i++) r = ajustarRitmo(r, lote(10, 10), { ahora: despues }).ritmo;
+  assert.equal(r.nivel, 3);
+});
+
+test('umbral: un freno corto aislado no veda nada; dos seguidos sí', () => {
+  const ahora = 1_000_000_000_000;
+  let a = ajustarRitmo({ nivel: 2, buenos: 0, malos: 0 }, lote(10, 7, 3), { ahora });
+  assert.equal(a.ritmo.umbral, null);
+  a = ajustarRitmo(a.ritmo, lote(10, 7, 3), { ahora });
+  assert.equal(a.ritmo.umbral, 4);           // se frenó en el 3 → vedado hasta el 4
+  assert.equal(a.ritmo.nivel, 4);
+});
+
+test('el umbral aprendido viaja entre ciclos y caduca solo', () => {
+  const ahora = 1_000_000_000_000;
+  const guardado = { nivel: 2, t: ahora - 60_000, umbral: 5, umbralHasta: ahora + 3_600_000 };
+  const r = ritmoInicial(guardado, { ahora });
+  assert.equal(r.nivel, 5);
+  assert.equal(r.umbral, 5);
+  const caducado = ritmoInicial({ ...guardado, umbralHasta: ahora - 1 }, { ahora });
+  assert.equal(caducado.nivel, 2);
+  assert.equal(caducado.umbral, null);
 });
