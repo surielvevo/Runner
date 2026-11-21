@@ -7,8 +7,8 @@
 # Cómo trabaja:
 #   · Un TURNO dura ~5 h 40 min y encadena ciclos «priority» de hasta 50 min con
 #     el navegador caliente: las materias con menos cupos se refrescan primero y
-#     más seguido (la cola va por urgencia), igual que antes. Una vez al día, a
-#     partir de las 05:30 UTC (01:30 en RD), un barrido «full» de respaldo.
+#     más seguido (la cola va por urgencia), igual que antes. El barrido «full» de
+#     respaldo queda solo a mano (modo=full) desde el 2026-11-21 (ver abajo).
 #   · RELEVO (2026-11-11): al terminar, cada turno pide él mismo el siguiente (job
 #     `relevo`). El horario de cada 30 min queda solo de respaldo: GitHub descarta la
 #     mayoría de los horarios seguidos (ese día disparó 3 de 36) y la programación

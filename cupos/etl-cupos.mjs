@@ -1792,12 +1792,22 @@ async function main() {
   // extra a la UASD (regla 6): reusa el universo ya descargado. GATE DE SEGURIDAD:
   // solo si el universo vino sano (≥80% de las claves en BD); si getAsignaturas
   // viniera truncado por un glitch, se omite en vez de vaciar el catálogo.
+  // (2026-11-21) Con tres turnos estaba apagada sin querer: comparaba las ~750 claves de SU parte
+  // con las ~2.000 de la base («universo pequeño»). Ahora mira el universo COMPLETO, cada turno
+  // cierra solo los fantasmas de su parte (sin trabajo repetido) y una vez por ciclo.
+  let universoReconciliado = false;
   async function reconcileUniverse() {
+    if (universoReconciliado) return;
+    universoReconciliado = true;
     try {
-      const universeUpper = new Set(claves.map(c => c.toUpperCase()));
-      if (claves.length >= Math.max(500, state.size * 0.8)) {
+      const universeUpper = new Set(universo.map(c => c.toUpperCase()));
+      if (universo.length >= Math.max(500, state.size * 0.8)) {
         const ghosts = new Map();
-        for (const claveUp of state.keys()) if (!universeUpper.has(claveUp)) ghosts.set(claveUp, new Set());
+        for (const claveUp of state.keys()) {
+          if (universeUpper.has(claveUp)) continue;
+          if (SHARD_TOTAL > 1 && shardDe(claveUp) !== SHARD_INDEX) continue;
+          ghosts.set(claveUp, new Set());
+        }
         if (ghosts.size) {
           const { cerradas: cerradasGhost } = await cerrarSeccionesDesaparecidas(ghosts);
           if (cerradasGhost) {
@@ -1806,7 +1816,7 @@ async function main() {
           }
         }
       } else {
-        console.warn(`   ⚠ Universo pequeño (${claves.length} claves vs ${state.size} en BD); se omite la reconciliación por universo (seguridad).`);
+        console.warn(`   ⚠ Universo pequeño (${universo.length} claves vs ${state.size} en BD); se omite la reconciliación por universo (seguridad).`);
       }
     } catch (e) { console.warn('   ⚠ reconciliación por universo:', e?.message || e); }
   }
