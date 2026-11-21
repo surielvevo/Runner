@@ -18,6 +18,9 @@
 #   · sano   = cierra el aviso abierto, con la hora de la recuperación.
 # Las curas automáticas viven en el propio turno (ritmo, descanso por IP, máquina nueva ante un
 # veto): el doctor no rota IP para esquivar un freno de la UASD.
+# Relevo de versión: si un turno corre un código del scraper distinto al de `main` y las pruebas
+# del de hoy pasan, lo cancela y deja uno con el código de hoy. Corre también con cada cambio del
+# scraper, así un arreglo entra al momento (antes esperaba hasta 5 h 40 min al relevo).
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Doctor de cupos
@@ -27,9 +30,11 @@ on:
     - cron: '5,15,25,35,45,55 * * * *'
   # Al cambiar este archivo, el doctor corre una vez: así se comprueba en el acto (y GitHub
   # vuelve a registrar el horario, que la primera vez no disparó nunca).
+  # (2026-11-21) También con cada cambio del scraper: el relevo de versión lo pone a trabajar al
+  # momento, sin esperar a que termine el turno en curso (hasta 5 h 40 min).
   push:
     branches: [main]
-    paths: ['.github/workflows/doctor-cupos.yml']
+    paths: ['.github/workflows/doctor-cupos.yml', '.github/workflows/cupos-uasd.yml', 'cupos/**']
   workflow_dispatch:
 
 permissions:
@@ -47,7 +52,7 @@ jobs:
   revisar:
     name: ¿Hay un turno trabajando y los datos al día?
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Revisar y, si no hay ninguno, arrancar un turno
         env:
@@ -69,6 +74,63 @@ jobs:
           done
           echo "::error::El doctor no pudo pedir un turno."
           exit 1
+
+      # ── Relevo de versión (2026-11-21) ──────────────────────────────────────────────────
+      # Un turno arranca con el código de su momento y dura hasta 5 h 40 min: un arreglo subido a
+      # `main` esperaba todo ese rato. Si un turno (en curso o en cola) corre un código del
+      # scraper distinto al de `main` y las pruebas del código de hoy pasan, el doctor lo cancela
+      # y deja en marcha uno con el código de hoy. Los diagnósticos de un push no se tocan.
+      - uses: actions/checkout@v4
+        if: ${{ !cancelled() }}
+        with:
+          fetch-depth: 50
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: ${{ !cancelled() }}
+        with:
+          node-version: '22'
+
+      - name: ¿Los turnos corren el código de hoy? (relevo de versión)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rutas=(cupos .github/workflows/cupos-uasd.yml)
+          hoy=$(git log -1 --format=%H -- "${rutas[@]}")
+          gh run list -R "$GITHUB_REPOSITORY" --workflow cupos-uasd.yml --limit 30 \
+            --json databaseId,status,headSha,displayTitle,event > runs.json || { echo "::warning::No se pudo leer la lista de turnos."; exit 0; }
+          jq -r '.[] | select(.status != "completed") | "\(.databaseId) \(.headSha) \(.event)"' runs.json > vivos.txt
+          viejos=(); al_dia=0
+          while read -r id sha evento; do
+            [ -z "$id" ] && continue
+            git cat-file -e "$sha^{commit}" 2>/dev/null || git fetch -q --depth=100 origin "$sha" 2>/dev/null || true
+            # Un push es turno solo si su mensaje lleva [turno] (como decide el propio workflow);
+            # si no, es un diagnóstico y no se toca.
+            if [ "$evento" = "push" ] && ! git log -1 --format=%B "$sha" 2>/dev/null | grep -qF '[turno]'; then continue; fi
+            if git diff --quiet "$sha" "$hoy" -- "${rutas[@]}" 2>/dev/null; then al_dia=$(( al_dia + 1 )); else viejos+=("$id"); fi
+          done < vivos.txt
+          if [ "${#viejos[@]}" -eq 0 ]; then echo "Los turnos corren el código de hoy ($(git rev-parse --short "$hoy"))."; exit 0; fi
+          # Nunca relevar a un código que no pasa sus pruebas (son sin red: unos segundos).
+          if ! (cd cupos && node --test pruebas/*.test.mjs > /dev/null); then
+            echo "::error::Las pruebas del código de hoy fallan: no se releva el turno."; exit 1
+          fi
+          for id in "${viejos[@]}"; do
+            echo "::warning::El turno $id corre un código viejo del scraper: se cancela para que entre el de hoy."
+            gh run cancel "$id" -R "$GITHUB_REPOSITORY" || true
+          done
+          # Esperar (máx. 2 min) a que se terminen de cancelar y, si no queda ninguno al día, pedirlo.
+          for i in $(seq 1 12); do
+            abiertos=$(gh run list -R "$GITHUB_REPOSITORY" --workflow cupos-uasd.yml --limit 30 \
+              --json databaseId,status -q '[.[] | select(.status != "completed") | .databaseId | tostring] | join(" ")' || echo "")
+            quedan=0; for id in "${viejos[@]}"; do case " $abiertos " in *" $id "*) quedan=1 ;; esac; done
+            [ "$quedan" -eq 0 ] && break
+            sleep 10
+          done
+          if [ "$al_dia" -eq 0 ]; then
+            gh workflow run cupos-uasd.yml -R "$GITHUB_REPOSITORY" --ref main -f modo=turno -f horas=5.6 \
+              && echo "Turno con el código de hoy ($(git rev-parse --short "$hoy")) pedido."
+          fi
 
       - name: ¿Los datos están al día? (una lectura agregada)
         id: salud
