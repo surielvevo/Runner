@@ -193,3 +193,58 @@ test('el umbral aprendido viaja entre ciclos y caduca solo', () => {
   assert.equal(caducado.nivel, 2);
   assert.equal(caducado.umbral, null);
 });
+
+test('umbral reincidente: castigado al caducar el veto, el siguiente dura el doble (tope 24 h)', () => {
+  const H = 3_600_000;
+  const t0 = 1_000_000_000_000;
+  // Caso real del 22-nov: umbral 5 (6 h) caduca, sube al 4 tras 3 lotes limpios y la UASD castiga 1 h.
+  let r = ritmoInicial({ nivel: 5, t: t0 - 60_000, umbral: 5, umbralHasta: t0 + 60_000, umbralHoras: 6 }, { ahora: t0 });
+  assert.equal(r.umbral, 5);
+  const t1 = t0 + 2 * 60_000;                      // el veto ya caducó
+  for (let i = 0; i < 3; i++) r = ajustarRitmo(r, lote(10, 10), { ahora: t1 }).ritmo;
+  assert.equal(r.nivel, 4);                        // prueba el escalón que estaba vedado
+  assert.equal(r.umbral, null);
+  assert.equal(r.previo.umbral, 5);                // pero recuerda el veto recién caducado
+  let a = ajustarRitmo(r, lote(5, 2, 3, 0, 3600), { ahora: t1 + 60_000 });
+  assert.equal(a.ritmo.umbral, 5);
+  assert.equal(a.ritmo.umbralHoras, 12);
+  assert.equal(a.ritmo.umbralHasta, t1 + 60_000 + 12 * H);
+  assert.equal(a.pausaMs, H);
+  // Otra reincidencia: 24 h; y no pasa de 24.
+  const t2 = a.ritmo.umbralHasta + 60_000;
+  r = { ...a.ritmo, nivel: 4, malos: 0 };
+  a = ajustarRitmo(r, lote(5, 2, 3, 0, 3600), { ahora: t2 });
+  assert.equal(a.ritmo.umbralHoras, 24);
+  const t3 = a.ritmo.umbralHasta + 60_000;
+  a = ajustarRitmo({ ...a.ritmo, nivel: 4, malos: 0 }, lote(5, 2, 3, 0, 3600), { ahora: t3 });
+  assert.equal(a.ritmo.umbralHoras, 24);
+});
+
+test('umbral: si el veto caducó hace más de 3 h, o el castigo es en un escalón más lento, vuelve a 6 h', () => {
+  const H = 3_600_000;
+  const t0 = 1_000_000_000_000;
+  const caducado = { nivel: 4, buenos: 0, malos: 0, umbral: 5, umbralHasta: t0 - 4 * H, umbralHoras: 12 };
+  let a = ajustarRitmo(caducado, lote(5, 2, 3, 0, 3600), { ahora: t0 });
+  assert.equal(a.ritmo.umbralHoras, 6);
+  // Veto 5 activo y castigo en el 5 (permitido): es un escalón nuevo, 6 h.
+  a = ajustarRitmo({ nivel: 5, buenos: 0, malos: 0, umbral: 5, umbralHasta: t0 + H, umbralHoras: 12 }, lote(5, 2, 3, 0, 3600), { ahora: t0 });
+  assert.equal(a.ritmo.umbral, 6);
+  assert.equal(a.ritmo.umbralHoras, 6);
+});
+
+test('umbral: cada parte lo desfasa para no volver a probar las tres a la vez', () => {
+  const t0 = 1_000_000_000_000;
+  const base = ajustarRitmo({ nivel: 3, buenos: 0, malos: 0 }, lote(6, 3, 3, 0, 900), { ahora: t0 });
+  const parte3 = ajustarRitmo({ nivel: 3, buenos: 0, malos: 0 }, lote(6, 3, 3, 0, 900), { ahora: t0, desfaseMs: 140 * 60_000 });
+  assert.equal(parte3.ritmo.umbralHasta - base.ritmo.umbralHasta, 140 * 60_000);
+  // El desfase solo mueve el momento de la prueba, no el ritmo de ahora.
+  assert.equal(parte3.ritmo.nivel, base.ritmo.nivel);
+});
+
+test('el veto recién caducado viaja entre ciclos (y se olvida a las 3 h)', () => {
+  const H = 3_600_000;
+  const t0 = 1_000_000_000_000;
+  const guardado = { nivel: 4, t: t0 - 60_000, umbral: null, umbralHasta: 0, previo: { umbral: 5, hasta: t0 - H, horas: 12 } };
+  assert.deepEqual(ritmoInicial(guardado, { ahora: t0 }).previo, { umbral: 5, hasta: t0 - H, horas: 12 });
+  assert.equal(ritmoInicial(guardado, { ahora: t0 + 3 * H }).previo, null);
+});

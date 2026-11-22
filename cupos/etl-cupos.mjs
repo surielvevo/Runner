@@ -177,7 +177,15 @@ function guardarMemoria() {
   escribirJson(MEMORIA_ARCHIVO, { v: 1, guardado: Date.now(), claves });
 }
 let ritmo = ritmoInicial(leerJson(RITMO_ARCHIVO), { tope: RITMO_TOPE, arranque: RITMO_ARRANQUE });
-function guardarRitmo() { escribirJson(RITMO_ARCHIVO, { nivel: ritmo.nivel, t: Date.now(), umbral: ritmo.umbral ?? null, umbralHasta: ritmo.umbralHasta || 0 }); }
+function guardarRitmo() {
+  escribirJson(RITMO_ARCHIVO, {
+    nivel: ritmo.nivel, t: Date.now(), umbral: ritmo.umbral ?? null, umbralHasta: ritmo.umbralHasta || 0,
+    umbralHoras: ritmo.umbralHoras || 0, previo: ritmo.previo || null,
+  });
+}
+// Cada parte vuelve a probar un escalón vedado en otro momento (0, 70 y 140 min después): si la
+// UASD castiga la prueba, cae una IP y no las tres a la vez.
+const DESFASE_UMBRAL_MS = SHARD_INDEX * 70 * 60_000;
 // Contadores del proceso (los lee también la salida ordenada por SIGTERM).
 const cuenta = { ok: 0, intentadas: 0, frenos: 0, bloqueos: 0, codigos: {} };
 function resumenCodigos() {
@@ -191,7 +199,8 @@ function resumenRitmo() {
   return `ritmo ${ritmo.nivel} (${n.conc} a la vez, ${(n.gapMin / 1000).toFixed(1)}–${(n.gapMax / 1000).toFixed(1)} s)` +
     ` · ok ${cuenta.ok}/${cuenta.intentadas}` + (frenos ? ` · frenos ${frenos} (${resumenCodigos()})` : '') +
     (Number.isInteger(ritmo.umbral) && ritmo.umbralHasta > Date.now()
-      ? ` · umbral ${ritmo.umbral} hasta ${new Date(ritmo.umbralHasta).toISOString().slice(11, 16)} UTC` : '');
+      ? ` · umbral ${ritmo.umbral} hasta ${new Date(ritmo.umbralHasta).toISOString().slice(11, 16)} UTC` +
+        (ritmo.umbralHoras > 6 ? ` (${ritmo.umbralHoras} h, reincidió)` : '') : '');
 }
 // La UASD sirvió su propia página de veto a la salida directa (lo ve testProxy).
 let vetoDirecto = null;
@@ -1747,7 +1756,7 @@ async function main() {
 
       // RITMO (AIMD): la UASD decide cuánto aguanta. Un freno baja el escalón y pausa.
       const antes = ritmo.nivel;
-      const ajuste = ajustarRitmo(ritmo, lote, { tope: RITMO_TOPE, ahora: Date.now() });
+      const ajuste = ajustarRitmo(ritmo, lote, { tope: RITMO_TOPE, ahora: Date.now(), desfaseMs: DESFASE_UMBRAL_MS });
       ritmo = ajuste.ritmo;
       if (ritmo.nivel !== antes) {
         console.log(`\n   Ritmo ${antes} → ${ritmo.nivel} · ${resumenRitmo()} · lote: ${lote.ok}/${lote.intentadas} bien, ${lote.frenos} frenos, ${lote.bloqueos} bloqueos.`);
