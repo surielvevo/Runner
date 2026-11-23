@@ -133,25 +133,82 @@ export function ajustarRitmo(r, lote, { tope = 1, ahora = Date.now(), desfaseMs 
 }
 
 // ── 2. Cada cuánto releer una materia ─────────────────────────────────────────
-/** Edad máxima (horas) que se tolera según el tipo de materia, aunque no cambie nunca. */
-export function techoHoras({ minDisp, fija = false, nSecc = 1 }) {
-  if (fija) return 0.1;          // vigilada por el agente de cupos: como mucho 6 min
-  if (nSecc === 0) return 24;    // la UASD no lista ninguna sección: una vez al día
-  if (minDisp <= 10) return 0.5; // apretada: 30 min
-  if (minDisp <= 24) return 2;   // bajando: 2 h
-  return 8;                      // con cupos de sobra: 8 h (el barrido ligero de siempre)
+// (2026-11-23, reglas del dueño para la selección) Se decide POR SECCIÓN. La UASD responde por
+// materia (una consulta trae todas sus secciones), así que manda su sección ABIERTA con menos
+// cupos; las llenas solo cuentan para cazar el cupo que se libere. Vigilancia activa desde 10 cupos
+// y más intensa desde 5; de 11 a 20 todavía hay cupos: solo revisión periódica; con más de 20 no se
+// toca (barrido diario, y el carril de demanda la relee al momento si un estudiante la abre).
+// Lo que no cambia se relee cada vez menos (×2 por lectura igual, hasta el techo) y un cambio la
+// devuelve a la base. Cuando el caudal no alcanza, la cola va por atraso (edad / intervalo): todas
+// las clases avanzan en proporción y ninguna se queda sin leer (sin huecos).
+export const CLASES = Object.freeze({
+  //                     base: horas × PRIORITY_SPEED (la de vigilada es fija) · techo: horas
+  vigilada:     Object.freeze({ base: 0.025, techo: 0.1 }), // agente de cupos y apretada: 1,5–6 min, al frente
+  critica:      Object.freeze({ base: 0.1, techo: 0.25 }),  // 1–5 cupos: 3–15 min
+  activa:       Object.freeze({ base: 0.25, techo: 0.5 }),  // 6–10 cupos (o llena sin detalle): 7,5–30 min
+  agotada:      Object.freeze({ base: 0.25, techo: 0.5 }),  // TODAS llenas: ahí la UASD abre secciones nuevas
+  nuevaSeccion: Object.freeze({ base: 0.25, techo: 0.5 }),  // estrenó sección (NRC nuevo) hace < 6 h
+  caza:         Object.freeze({ base: 2, techo: 2 }),       // solo quedan llenas (o llenas + holgadas): 1–2 h
+  periodica:    Object.freeze({ base: 3, techo: 4 }),       // 11–20 cupos: 1,5–4 h
+  holgada:      Object.freeze({ base: 24, techo: 24 }),     // > 20 cupos en todas: 12–24 h
+  sinSecciones: Object.freeze({ base: 12, techo: 12 }),     // la UASD no lista ninguna: 6–12 h (¿abrió la primera?)
+});
+
+/**
+ * Lo que importa de las secciones de una materia según la memoria de su última lectura
+ * (`d` = { nrc: disponibles }, `m` = menor disponible, 0 si hay alguna llena u oculta).
+ * Devuelve { minAbierta, hayLlena } o null si no hay detalle por sección.
+ */
+export function resumenSecciones(mem) {
+  if (!mem || !mem.d || typeof mem.d !== 'object') return null;
+  let minAbierta = Infinity, hayLlena = Number(mem.m) <= 0;
+  for (const v of Object.values(mem.d)) {
+    const n = Number(v) || 0;
+    if (n > 0) { if (n < minAbierta) minAbierta = n; } else hayLlena = true;
+  }
+  return { minAbierta, hayLlena };
+}
+
+/** Ventana en que una materia que estrenó sección sigue en vigilancia activa (la UASD suele abrir varias). */
+export const NUEVA_SECCION_MS = 6 * 3_600_000;
+
+/**
+ * Clase de relectura de una materia (ver CLASES). `minAbierta` = Infinity si no queda ninguna abierta.
+ * `recienNueva` = apareció una sección (NRC) que no estaba en la lectura anterior hace menos de 6 h.
+ */
+export function claseRelectura({ minAbierta = Infinity, hayLlena = false, nSecc = 1, vigilada = false, sinDetalle = false, recienNueva = false }) {
+  if (!(nSecc > 0)) return 'sinSecciones';
+  const m = Number.isFinite(minAbierta) ? minAbierta : Infinity;
+  if (vigilada && (hayLlena || m <= 10)) return 'vigilada';
+  if (m <= 5) return 'critica';
+  if (m <= 10) return 'activa';
+  // Llena sin detalle por sección (solo el mínimo de la base): podría tener una abierta casi
+  // agotada detrás del 0, así que va como activa hasta la primera lectura (sin huecos).
+  if (hayLlena && sinDetalle) return 'activa';
+  if (hayLlena && m === Infinity) return 'agotada';
+  if (recienNueva) return 'nuevaSeccion';
+  if (hayLlena) return 'caza';
+  if (m <= 20) return 'periodica';
+  return 'holgada';
+}
+
+/** Intervalo de relectura (horas) de una clase: base × 2 por lectura sin cambios, hasta el techo. */
+export function intervaloRelectura(clase, { sinCambios = 0, speed = 1 } = {}) {
+  const c = CLASES[clase] || CLASES.holgada;
+  const b = Math.max(0.005, clase === 'vigilada' ? c.base : c.base * (Number(speed) || 1));
+  const mult = 2 ** Math.min(Math.max(0, sinCambios | 0), 4);
+  return Math.max(Math.min(b, c.techo), Math.min(b * mult, c.techo));
 }
 
 /**
- * Intervalo de relectura (horas). `base` = presupuesto de siempre por cupos (ya con
- * PRIORITY_SPEED). Cada lectura sin cambios lo duplica (×2, ×4, ×8, ×16) hasta el techo;
- * un cambio lo devuelve a la base (`sinCambios` = 0).
+ * (2026-11-23) ¿Se da por leída una respuesta de la UASD que trae filas pero NINGUNA sección válida
+ * (sin periodo ni NRC)? Sí cuando la materia nunca tuvo secciones: es su forma de decir «no hay».
+ * Antes no se daba por leída y seguía «nueva»: ~106 materias por parte se releían en CADA ciclo
+ * (dos tercios del caudal, medido el 23-nov). Si la materia sí tenía secciones, no: puede ser una
+ * respuesta a medias y se vuelve a pedir (y nunca cierra secciones).
  */
-export function intervaloHoras({ base, minDisp, fija = false, sinCambios = 0, nSecc = 1 }) {
-  const techo = techoHoras({ minDisp, fija, nSecc });
-  const b = Math.max(0.005, Number(base) || 0);
-  const mult = 2 ** Math.min(Math.max(0, sinCambios | 0), 4);
-  return Math.max(Math.min(b, techo), Math.min(b * mult, techo));
+export function respuestaSinSecciones({ filas = 0, validas = 0, seccionesConocidas = 0 }) {
+  return filas > 0 && validas === 0 && !(seccionesConocidas > 0);
 }
 
 // ── 3. Qué creer de una respuesta ─────────────────────────────────────────────
@@ -165,16 +222,20 @@ export function compararLectura(anterior, filas, pendientes = []) {
   const ahora = {};
   for (const f of filas) if (f && f.nrc) ahora[String(f.nrc)] = Number(f.disponibles) || 0;
   let cambio = !anterior || typeof anterior !== 'object';
+  // (2026-11-23) Secciones (NRC) que no estaban en la lectura anterior: sección nueva o una cerrada que
+  // reapareció. Sin lectura anterior no se cuenta nada (no es «nueva», es la primera vez que se mira).
+  let nuevos = 0;
   if (!cambio) {
     for (const [nrc, d] of Object.entries(ahora)) {
-      if (anterior[nrc] !== d) { cambio = true; break; }
+      if (!(nrc in anterior)) nuevos++;
+      if (anterior[nrc] !== d) cambio = true;
     }
   }
   const mapa = { ...ahora };
   if (anterior && typeof anterior === 'object') {
     for (const nrc of pendientes) if (!(nrc in mapa) && nrc in anterior) mapa[nrc] = anterior[nrc];
   }
-  return { cambio, mapa };
+  return { cambio, mapa, nuevos };
 }
 
 /**

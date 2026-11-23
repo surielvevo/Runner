@@ -38,7 +38,8 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 import { createClient } from '@supabase/supabase-js';
 import {
-  NIVELES, ritmoInicial, ajustarRitmo, intervaloHoras, compararLectura, periodoDominante,
+  NIVELES, ritmoInicial, ajustarRitmo, compararLectura, periodoDominante,
+  resumenSecciones, claseRelectura, intervaloRelectura, respuestaSinSecciones, NUEVA_SECCION_MS,
   confirmarFaltantes, esBloqueoDuro, esErrorDeBloqueo, descansoMin,
 } from './ritmo.mjs';
 
@@ -109,6 +110,12 @@ const UASD_PAGE     = 'https://app.uasd.edu.do/ProgramacionPorAsignatura/Default
 // concurrencia y nadie scrapea nada en todo ese tiempo.
 const DEADLINE_MIN  = Math.max(0, Number(process.env.ETL_DEADLINE_MIN || 0));
 const START_TS      = Date.now();
+// (2026-11-23) En priority, cada pasada dura como mucho esto y luego se vuelve a elegir por atraso.
+// Con la UASD dejando ~190 consultas/h por IP una pasada duraba el ciclo entero (50 min): una
+// materia apretada o vigilada leída al principio no se volvía a mirar en 50 min aunque su
+// intervalo fuera de 6–30 min. Cero consultas de más: solo se reordena la cola. 0 = apagado.
+const PASADA_MAX_MS = (ETL_MODE === 'priority' && DEADLINE_MIN > 0)
+  ? Math.max(0, Number(process.env.PASADA_MAX_MIN ?? 10)) * 60_000 : 0;
 // Un lote jamás puede tardar más que esto: si page.evaluate se cuelga (browser
 // zombie), lo cortamos y relanzamos Chromium en vez de esperar horas.
 const BATCH_HARD_TIMEOUT = 15 * 60_000;
@@ -909,28 +916,38 @@ function overdueScore(st) {
   return st.ageH / budget;
 }
 
-// (2026-11-21) Vencimiento ADAPTATIVO del modo priority. Mismo presupuesto por cupos de
-// siempre como base, pero lo que no cambia se relee cada vez menos (×2 por lectura igual, con
-// techo de edad: vigiladas 6 min, apretadas 30 min, bajando 2 h, holgadas 8 h, sin secciones
-// 24 h) y vuelve a la base apenas cambia. Antes cada materia pendiente se releía ~40 veces por
-// ciclo aunque no se moviera (900.000 lecturas al día): la UASD empezó a frenarnos el 16-nov.
-// Las vigiladas por el agente ya no entran «siempre»: base de 1,5 min y techo de 6 min.
+// (2026-11-21) Vencimiento ADAPTATIVO del modo priority: lo que no cambia se relee cada vez menos
+// (×2 por lectura igual, con techo) y vuelve a la base apenas cambia. Antes cada materia pendiente
+// se releía ~40 veces por ciclo aunque no se moviera (900.000 lecturas al día).
+// (2026-11-23, reglas del dueño para la selección) La clase sale de las SECCIONES (`claseRelectura`
+// en ritmo.mjs): manda la abierta con menos cupos (≤ 5 crítica, ≤ 10 activa, 11–20 periódica,
+// > 20 no se toca); las llenas solo para cazar el cupo que se libere; la vigilada por el agente va a
+// 6 min y al frente solo si está apretada. El detalle por sección sale de la memoria de la última
+// lectura; sin él, del mínimo de la base.
 function vencimiento(claveUp, state, ahora) {
   const st = state.get(claveUp);
   const mem = memoria.get(claveUp);
   const leidaMs = Math.max(st?.leidaMs || 0, mem?.t || 0);
   if (!leidaMs) return { vencida: true, atraso: Number.POSITIVE_INFINITY, faltaMs: 0, nueva: true };
-  const fija = PINNED_KEYS.has(normalizeClave(claveUp));
   const minDisp = st ? st.minDisp : (Number.isFinite(mem?.m) ? mem.m : 999);
   const nSecc = st ? st.nSecc : (Number.isFinite(mem?.s) ? mem.s : 0);
-  const base = fija ? Math.min(refreshBudgetHours(minDisp), 0.025) : refreshBudgetHours(minDisp);
-  const intervalo = intervaloHoras({ base, minDisp, fija, sinCambios: mem?.n || 0, nSecc });
+  // La memoria vale si es de la misma lectura que la base (o más nueva): solo esta parte escribe sus claves.
+  const det = mem && (Number(mem.t) || 0) >= (st?.leidaMs || 0) - 10 * 60_000 ? resumenSecciones(mem) : null;
+  const clase = claseRelectura({
+    minAbierta: det ? det.minAbierta : (minDisp > 0 ? minDisp : Infinity),
+    hayLlena: det ? det.hayLlena : minDisp <= 0,
+    sinDetalle: !det,
+    nSecc,
+    vigilada: PINNED_KEYS.has(normalizeClave(claveUp)),
+    recienNueva: ahora - (Number(mem?.nv) || 0) < NUEVA_SECCION_MS,
+  });
+  const intervalo = intervaloRelectura(clase, { sinCambios: mem?.n || 0, speed: PRIORITY_SPEED });
   const edadH = Math.max(0, (ahora - leidaMs) / 3_600_000);
   return {
     vencida: edadH >= intervalo,
     atraso: edadH / intervalo,
     faltaMs: Math.max(0, (intervalo - edadH) * 3_600_000),
-    fija, minDisp,
+    fija: clase === 'vigilada', clase, minDisp,
   };
 }
 
@@ -962,7 +979,7 @@ function selectTargets(claves, state) {
   // priority INTELIGENTE: cada clave vence según su presupuesto (a menos cupos,
   // más seguido) y según cuánto cambia (ver `vencimiento`). Las de cupos de sobra rara vez
   // entran → cola de último. Las nunca leídas entran de primeras.
-  let nuevas = 0; const t = { fijas: 0, criticas: 0, calientes: 0, templadas: 0, holgadas: 0 };
+  let nuevas = 0; const t = { vigilada: 0, critica: 0, activa: 0, agotada: 0, nuevaSeccion: 0, caza: 0, periodica: 0, holgada: 0, sinSecciones: 0 };
   const ahora = Date.now();
   const venc = new Map();
   const targets = claves.filter(c => {
@@ -970,11 +987,7 @@ function selectTargets(claves, state) {
     venc.set(c, v);
     if (!v.vencida) return false;              // aún fresca para su nivel de cupos y de cambio
     if (v.nueva) nuevas++;
-    else if (v.fija) t.fijas++;
-    else if (v.minDisp <= 3) t.criticas++;
-    else if (v.minDisp <= 8) t.calientes++;
-    else if (v.minDisp <= 15) t.templadas++;
-    else t.holgadas++;
+    else t[v.clase] = (t[v.clase] || 0) + 1;
     return true;
   }).sort((a, b) => {
     // Las fijadas vencidas van primero para que ni un corte por presupuesto las deje fuera.
@@ -983,7 +996,7 @@ function selectTargets(claves, state) {
     const d = vb.atraso - va.atraso;            // lo más atrasado respecto a SU intervalo, primero
     return Number.isNaN(d) ? 0 : d;
   });
-  console.log(`   Modo priority inteligente → ${targets.length} claves | fijas:${t.fijas} criticas:${t.criticas} calientes:${t.calientes} templadas:${t.templadas} holgadas:${t.holgadas} nuevas:${nuevas} · omitidas ${claves.length - targets.length} frescas.`);
+  console.log(`   Modo priority inteligente → ${targets.length} vencidas | vigiladas:${t.vigilada} críticas(≤5):${t.critica} activas(≤10):${t.activa} agotadas:${t.agotada} con sección nueva:${t.nuevaSeccion} caza(llenas):${t.caza} periódicas(11–20):${t.periodica} holgadas(>20):${t.holgada} sin secciones:${t.sinSecciones} nuevas:${nuevas} · ${claves.length - targets.length} al día.`);
   return targets;
 }
 
@@ -1607,7 +1620,7 @@ async function main() {
 
   // ── 3. getData — ritmo que se adapta a la UASD (ritmo.mjs) ─────────────────
   let totalRows = 0, seccionesNuevas = 0, processedTotal = 0, stoppedByDeadline = false;
-  let totalCerradas = 0, errors = 0, lastTargets = 0;
+  let totalCerradas = 0, errors = 0, lastTargets = 0, sinSecciones = 0;
   let ultimaRecuperacion = 0;
 
   const perfilActual = () => ({ ...NIVELES[ritmo.nivel], loteMs: LOTE_MAX_MS, frenoTope: FRENO_SEGUIDOS });
@@ -1632,7 +1645,7 @@ async function main() {
     const nrcDe = (k) => k.slice(k.lastIndexOf('|') + 1);
     const pendientes = info?.pendientes || [];
     const cerradas = info?.cerradas || [];
-    const { cambio, mapa } = compararLectura(mem.d || null, unicos, pendientes.map(nrcDe));
+    const { cambio, mapa, nuevos } = compararLectura(mem.d || null, unicos, pendientes.map(nrcDe));
     for (const k of cerradas) delete mapa[nrcDe(k)];
     const periodo = periodoDominante(unicos);
     const delPeriodo = periodo ? unicos.filter((u) => u.periodo === periodo) : unicos;
@@ -1650,6 +1663,8 @@ async function main() {
       f: pendientes,
       m: minDisp,
       s: nSecc,
+      // (2026-11-23) Cuándo estrenó sección por última vez: queda en vigilancia activa 6 h.
+      nv: nuevos > 0 ? ahora : (Number(mem.nv) || 0),
     });
     state.set(claveUp, { ...(prev || {}), minDisp, nSecc, leidaMs: ahora, ageH: 0, isDue: false });
   }
@@ -1660,12 +1675,18 @@ async function main() {
     const cola = [...list];
     let processed = 0;
     let frenosLista = 0;
+    const inicioLista = Date.now();
     while (cola.length) {
       // PRESUPUESTO: si se agotó el tiempo, corta ORDENADO. Lo urgente ya se
       // procesó (la cola va por atraso); el resto entra en el próximo ciclo.
       if (minutesLeft() <= 1) {
         stoppedByDeadline = true;
         console.warn(`\n   ⏱ Presupuesto de ${DEADLINE_MIN} min agotado en [${label}]: corte ordenado con ${processed} consultas (${cola.length} siguen en cola).`);
+        break;
+      }
+      // (2026-11-23) Re-priorizar: lo que queda vuelve a elegirse por atraso en la próxima pasada.
+      if (PASADA_MAX_MS && Date.now() - inicioLista >= PASADA_MAX_MS) {
+        console.log(`\n   ↺ [${label}] ${processed} consultas en ${Math.round(PASADA_MAX_MS / 60_000)} min: se vuelve a elegir por atraso (${cola.length} quedan para la próxima elección).`);
         break;
       }
       const batch = cola.splice(0, BATCH_SIZE);
@@ -1719,8 +1740,18 @@ async function main() {
             // OK y la UASD devolvió lista VACÍA → la materia ya no lista NINGUNA sección.
             scrapedByClave.set(claveUp, new Set());
             leidas.set(claveUp, []);
+          } else if (respuestaSinSecciones({
+            filas: filas.length, validas: 0,
+            seccionesConocidas: Math.max(state.get(claveUp)?.nSecc || 0, memoria.get(claveUp)?.s || 0),
+          })) {
+            // (2026-11-23) Filas sin periodo/NRC de una materia que nunca tuvo secciones = «no hay
+            // secciones»: se da por leída (vuelve en 6–12 h) SIN reconciliar nada. Antes seguía
+            // «nueva» y se releía en cada ciclo (~106 por parte, dos tercios del caudal).
+            leidas.set(claveUp, []);
+            if (++sinSecciones === 1) console.log(`\n   ∅ ${r.clave}: la UASD responde sin secciones (${String(JSON.stringify(filas[0])).slice(0, 120)}); vuelve en 6–12 h.`);
           }
-          // (filas sin periodo/nrc = respuesta rara: ni se reconcilia ni se da por leída)
+          // (filas sin periodo/nrc de una materia CON secciones = respuesta rara: ni se reconcilia
+          // ni se da por leída; se vuelve a pedir)
         } else {
           failed.push(r.clave);
           if (r.rateLimited) lote.frenos++;
@@ -1929,7 +1960,7 @@ async function main() {
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`\n══════════════════════════════════════════`);
-  console.log(`   Pasadas:${pass} | Últimas claves:${lastTargets} | Procesadas(acum):${processedTotal} | Filas:${totalRows} | Secciones nuevas:${seccionesNuevas} | Cerradas(llenas):${totalCerradas} | Sin datos:${errors} | ${elapsed}s`);
+  console.log(`   Pasadas:${pass} | Últimas claves:${lastTargets} | Procesadas(acum):${processedTotal} | Filas:${totalRows} | Secciones nuevas:${seccionesNuevas} | Cerradas(llenas):${totalCerradas} | Sin secciones:${sinSecciones} | Sin datos:${errors} | ${elapsed}s`);
   console.log(`══════════════════════════════════════════\n`);
 
   const tooManyMissing = lastTargets > 0 && errors > lastTargets * 0.3;

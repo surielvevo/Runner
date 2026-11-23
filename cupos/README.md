@@ -11,6 +11,14 @@ sin depender de ninguna computadora encendida.
 | `diagnostico.mjs` | Comprueba, sin escribir nada, si la UASD responde desde el runner (directo y por proxies) y el código de una consulta de cupos. |
 | `ritmo.mjs` | (2026-11-21) El «cerebro»: ritmo AIMD que baja al primer freno de la UASD (respeta su `Retry-After`, hasta 1 h; el escalón que provocó un castigo largo queda vedado 6 h, como el umbral de TCP) y sube tras lotes sanos, relectura según cuánto cambia cada materia (con techo de edad), doble confirmación antes de cerrar una sección y reconocimiento del veto de la UASD. Lógica pura: `npm test` (`pruebas/`). |
 
+**Reglas de la selección (23-nov-2026, del dueño)**: se decide por SECCIÓN (la UASD responde por materia, así
+que manda su sección abierta con menos cupos): ≤ 5 cupos crítica (3–15 min), ≤ 10 activa (7,5–30 min), 11–20
+periódica (1,5–4 h), > 20 no se toca (12–24 h; el carril de demanda la relee si un estudiante la abre). Todas
+llenas o recién estrenada una sección (6 h) = vigilancia activa (≤ 30 min): ahí la UASD abre secciones nuevas.
+Las vigiladas por el agente van a 6 min y al frente solo si están apretadas. Cada pasada dura ≤ 10 min y se
+vuelve a elegir por atraso. Una materia que la UASD responde sin secciones se da por leída (6–12 h). Mismo
+ritmo de consultas a la UASD: solo se reparte mejor (`claseRelectura` en `ritmo.mjs`).
+
 **Lección del 16 al 21-nov-2026**: con ~900.000 lecturas al día la UASD empezó a frenar `getData` y a
 vetar algunas IP («403 Prohibido por el servidor»). El ETL reintentaba en ráfaga y un turno vetado se
 relanzaba cada 35 s. Ahora la UASD marca el ritmo, lo que no cambia se relee cada vez menos, un ciclo

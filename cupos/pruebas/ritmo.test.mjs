@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  NIVELES, NIVEL_LENTO, ritmoInicial, ajustarRitmo, techoHoras, intervaloHoras,
+  NIVELES, NIVEL_LENTO, ritmoInicial, ajustarRitmo,
+  CLASES, resumenSecciones, claseRelectura, intervaloRelectura, respuestaSinSecciones, NUEVA_SECCION_MS,
   compararLectura, confirmarFaltantes, periodoDominante, esBloqueoDuro, esErrorDeBloqueo, descansoMin,
 } from '../ritmo.mjs';
 
@@ -75,32 +76,6 @@ test('los escalones van de rápido a lento', () => {
     const a = NIVELES[i - 1], b = NIVELES[i];
     assert.ok(b.conc <= a.conc && b.gapMin >= a.gapMin && b.gapMax >= b.gapMin, `nivel ${i}`);
   }
-});
-
-test('intervalo: lo que no cambia se relee cada vez menos, con techo por tipo', () => {
-  const critica = { base: 0.025, minDisp: 2 };          // 1,5 min
-  assert.equal(intervaloHoras({ ...critica, sinCambios: 0 }), 0.025);
-  assert.equal(intervaloHoras({ ...critica, sinCambios: 1 }), 0.05);
-  assert.equal(intervaloHoras({ ...critica, sinCambios: 4 }), 0.4);
-  assert.equal(intervaloHoras({ ...critica, sinCambios: 50 }), 0.4); // ×16 máximo
-  const llena = { base: 0.05, minDisp: 0 };              // 3 min → techo 30 min
-  assert.equal(intervaloHoras({ ...llena, sinCambios: 9 }), 0.5);
-  const holgada = { base: 4, minDisp: 30 };              // 4 h → techo 8 h
-  assert.equal(intervaloHoras({ ...holgada, sinCambios: 0 }), 4);
-  assert.equal(intervaloHoras({ ...holgada, sinCambios: 3 }), 8);
-  const sinSecciones = { base: 4, minDisp: 999, nSecc: 0 };
-  assert.equal(intervaloHoras({ ...sinSecciones, sinCambios: 9 }), 24);
-});
-
-test('intervalo de una vigilada por el agente: base corta y techo de 6 min', () => {
-  assert.equal(intervaloHoras({ base: 0.025, minDisp: 0, fija: true, sinCambios: 0 }), 0.025);
-  assert.equal(intervaloHoras({ base: 0.025, minDisp: 0, fija: true, sinCambios: 9 }), 0.1);
-  assert.equal(techoHoras({ minDisp: 50, fija: true }), 0.1);
-});
-
-test('intervalo nunca baja de la base ni pasa el techo aunque la base sea rara', () => {
-  assert.equal(intervaloHoras({ base: 16, minDisp: 30, sinCambios: 0 }), 8);
-  assert.ok(intervaloHoras({ base: 0, minDisp: 2, sinCambios: 0 }) > 0);
 });
 
 test('compararLectura: igual = sin cambio; otro número o sección nueva = cambio', () => {
@@ -247,4 +222,94 @@ test('el veto recién caducado viaja entre ciclos (y se olvida a las 3 h)', () =
   const guardado = { nivel: 4, t: t0 - 60_000, umbral: null, umbralHasta: 0, previo: { umbral: 5, hasta: t0 - H, horas: 12 } };
   assert.deepEqual(ritmoInicial(guardado, { ahora: t0 }).previo, { umbral: 5, hasta: t0 - H, horas: 12 });
   assert.equal(ritmoInicial(guardado, { ahora: t0 + 3 * H }).previo, null);
+});
+
+test('respuesta con filas pero sin ninguna sección válida', () => {
+  // Materia que nunca tuvo secciones: se da por leída (no vuelve en cada ciclo).
+  assert.equal(respuestaSinSecciones({ filas: 1, validas: 0, seccionesConocidas: 0 }), true);
+  // Materia con secciones: puede ser una respuesta a medias → se vuelve a pedir.
+  assert.equal(respuestaSinSecciones({ filas: 1, validas: 0, seccionesConocidas: 4 }), false);
+  // Lista vacía o con secciones válidas: no es este caso.
+  assert.equal(respuestaSinSecciones({ filas: 0, validas: 0, seccionesConocidas: 0 }), false);
+  assert.equal(respuestaSinSecciones({ filas: 3, validas: 3, seccionesConocidas: 0 }), false);
+});
+
+// (2026-11-23) Reglas del dueño para la selección: por sección, activa desde 10, intensa desde 5,
+// 11–20 periódica, > 20 no se toca. Sustituye a techoHoras/intervaloHoras (techo 8 h a las holgadas).
+test('clase por sección: manda la abierta con menos cupos', () => {
+  const c = (minAbierta, extra = {}) => claseRelectura({ minAbierta, ...extra });
+  assert.equal(c(1), 'critica');
+  assert.equal(c(5), 'critica');
+  assert.equal(c(6), 'activa');
+  assert.equal(c(10), 'activa');
+  assert.equal(c(11), 'periodica');
+  assert.equal(c(15), 'periodica');   // con 15 todavía hay cupos: no es vigilancia activa
+  assert.equal(c(20), 'periodica');
+  assert.equal(c(21), 'holgada');     // > 20: no se toca
+  assert.equal(c(Infinity, { hayLlena: true }), 'agotada');         // todas llenas: ahí abren secciones
+  assert.equal(c(30, { hayLlena: true }), 'caza');                  // llena + holgadas
+  assert.equal(c(4, { hayLlena: true }), 'critica');                // llena + una casi agotada
+  assert.equal(c(Infinity, { hayLlena: true, sinDetalle: true }), 'activa'); // sin detalle: prudente
+  assert.equal(c(30, { nSecc: 0 }), 'sinSecciones');
+});
+
+test('vigilada por el agente: 6 min y al frente solo si está apretada', () => {
+  assert.equal(claseRelectura({ minAbierta: 8, vigilada: true }), 'vigilada');
+  assert.equal(claseRelectura({ minAbierta: 40, hayLlena: true, vigilada: true }), 'vigilada'); // caza su NRC lleno
+  assert.equal(claseRelectura({ minAbierta: 15, vigilada: true }), 'periodica');
+  assert.equal(claseRelectura({ minAbierta: 45, vigilada: true }), 'holgada');  // 75 así el 23-nov
+  assert.equal(claseRelectura({ minAbierta: 3, vigilada: true, nSecc: 0 }), 'sinSecciones');
+  assert.equal(intervaloRelectura('vigilada', { sinCambios: 0, speed: 0.5 }), 0.025);
+  assert.equal(intervaloRelectura('vigilada', { sinCambios: 9, speed: 0.5 }), 0.1);
+});
+
+test('intervalo por clase: base × 2 por lectura igual, con techo; más apretada = más seguido', () => {
+  assert.equal(intervaloRelectura('critica', { sinCambios: 0, speed: 0.5 }), 0.05);   // 3 min
+  assert.equal(intervaloRelectura('critica', { sinCambios: 9, speed: 0.5 }), 0.25);   // 15 min
+  assert.equal(intervaloRelectura('activa', { sinCambios: 9, speed: 0.5 }), 0.5);     // 30 min
+  assert.equal(intervaloRelectura('caza', { sinCambios: 9, speed: 0.5 }), 2);
+  assert.equal(intervaloRelectura('periodica', { sinCambios: 0, speed: 0.5 }), 1.5);
+  assert.equal(intervaloRelectura('periodica', { sinCambios: 9, speed: 0.5 }), 4);
+  assert.equal(intervaloRelectura('holgada', { sinCambios: 0, speed: 0.5 }), 12);
+  assert.equal(intervaloRelectura('holgada', { sinCambios: 9, speed: 0.5 }), 24);
+  assert.equal(intervaloRelectura('sinSecciones', { sinCambios: 0, speed: 0.5 }), 6);
+  assert.equal(intervaloRelectura('sinSecciones', { sinCambios: 9, speed: 0.5 }), 12);
+  assert.equal(intervaloRelectura('desconocida', { sinCambios: 9 }), 24);
+  assert.ok(intervaloRelectura('critica', { speed: 0 }) > 0);
+  const orden = ['vigilada', 'critica', 'activa', 'caza', 'periodica', 'holgada'];
+  for (const k of ['agotada', 'nuevaSeccion']) assert.equal(intervaloRelectura(k, { sinCambios: 9, speed: 0.5 }), 0.5);
+  for (const n of [0, 2, 9]) {
+    for (let i = 1; i < orden.length; i++) {
+      assert.ok(intervaloRelectura(orden[i], { sinCambios: n, speed: 0.5 }) >= intervaloRelectura(orden[i - 1], { sinCambios: n, speed: 0.5 }), `${orden[i]} (${n})`);
+    }
+  }
+  for (const [k, v] of Object.entries(CLASES)) assert.ok(v.base > 0 && v.techo >= v.base * 0.5, k);
+});
+
+test('resumen de secciones desde la memoria de la última lectura', () => {
+  assert.equal(resumenSecciones(null), null);
+  assert.equal(resumenSecciones({ t: 1 }), null);
+  assert.deepEqual(resumenSecciones({ d: { 1: 25, 2: 7, 3: 40 }, m: 7 }), { minAbierta: 7, hayLlena: false });
+  assert.deepEqual(resumenSecciones({ d: { 1: 0, 2: 30 }, m: 0 }), { minAbierta: 30, hayLlena: true });
+  // Sección llena que la UASD oculta: no está en d, pero m = 0 lo delata.
+  assert.deepEqual(resumenSecciones({ d: { 1: 22 }, m: 0 }), { minAbierta: 22, hayLlena: true });
+  assert.deepEqual(resumenSecciones({ d: {}, m: 0 }), { minAbierta: Infinity, hayLlena: true });
+});
+
+test('secciones nuevas: la materia que estrena NRC queda en vigilancia activa 6 h', () => {
+  // compararLectura cuenta los NRC que no estaban en la lectura anterior.
+  const fila = (nrc, disponibles) => ({ nrc, disponibles, periodo: 'P' });
+  assert.equal(compararLectura(null, [fila('1', 20)]).nuevos, 0);            // primera vez: no es «nueva»
+  assert.equal(compararLectura({ 1: 20 }, [fila('1', 20)]).nuevos, 0);
+  const r = compararLectura({ 1: 20 }, [fila('1', 20), fila('2', 30)]);
+  assert.equal(r.nuevos, 1);
+  assert.equal(r.cambio, true);
+  assert.equal(compararLectura({}, [fila('7', 40)]).nuevos, 1);              // abrió la primera sección
+  assert.equal(compararLectura({ 1: 20, 2: 5 }, [fila('1', 20), fila('2', 4)]).nuevos, 0);
+  // Con > 20 cupos en todas sería holgada (24 h); tras estrenar sección, activa (≤ 30 min).
+  assert.equal(claseRelectura({ minAbierta: 30, recienNueva: true }), 'nuevaSeccion');
+  assert.equal(claseRelectura({ minAbierta: 30, hayLlena: true, recienNueva: true }), 'nuevaSeccion');
+  assert.equal(claseRelectura({ minAbierta: 3, recienNueva: true }), 'critica');   // lo más apretado manda
+  assert.equal(claseRelectura({ minAbierta: 30, recienNueva: false }), 'holgada');
+  assert.equal(NUEVA_SECCION_MS, 6 * 3_600_000);
 });
