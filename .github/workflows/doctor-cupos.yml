@@ -16,6 +16,10 @@
 #   · aviso  = el catálogo va atrasado pero se está escribiendo (p. ej. poniéndose al día):
 #              solo queda en el resumen de la ejecución, sin molestar;
 #   · sano   = cierra el aviso abierto, con la hora de la recuperación.
+#   · pausa  = (2026-11-23) la UASD pidió esperar (429 + Retry-After) y todas las partes laten en esa
+#              pausa: es lo esperado y se reanuda sola; solo queda en el resumen. Si pasa de 2 h sin
+#              escribir, vuelve a ser grave. (El 23-nov la UASD frenó las 3 IP de 20:47 a 21:50 UTC y
+#              el aviso salía como si el scraper estuviera caído.)
 # Las curas automáticas viven en el propio turno (ritmo, descanso por IP, máquina nueva ante un
 # veto): el doctor no rota IP para esquivar un freno de la UASD.
 # Relevo de versión: si un turno corre un código del scraper distinto al de `main` y las pruebas
@@ -151,14 +155,19 @@ jobs:
             exit 0
           fi
           echo "$salud" > salud.json
+          # pausa: la UASD pidió esperar (429) y todas las partes laten en esa pausa; grave si > 2 h.
           # grave: nada escrito en 45 min o una parte del catálogo sin latido en 60 min.
           # aviso: catálogo atrasado (< 85 % leído en 8 h, < 60 % de las apretadas en 30 min) o
           #        demanda de estudiantes mal atendida, pero escribiéndose.
           estado=$(jq -r '
             def pct(a; b): if b > 0 then (100 * a / b) else 100 end;
             (.ultima_escritura_min // 99999) as $esc
-            | ([.turnos[] | select(.turno | startswith("turno ")) | select(.latido_min > 60)] | length) as $muertos
-            | if $esc > 45 or $muertos > 0 then "grave"
+            | [.turnos[] | select(.turno | startswith("turno "))] as $partes
+            | ([$partes[] | select(.latido_min > 60)] | length) as $muertos
+            | (($partes | length) > 0 and ($partes | all(.[]; (.latido_min <= 75)
+                and ((.detalle // "") | test("freno de la UASD|429"))))) as $pausa_uasd
+            | if $pausa_uasd and $esc > 45 and $esc <= 120 then "pausa"
+              elif $esc > 45 or $muertos > 0 then "grave"
               elif pct(.catalogo.leidas_8h; .catalogo.claves) < 85
                 or pct(.catalogo.apretadas_30m; .catalogo.apretadas) < 60
                 or (.demanda_1h.pedidas >= 5 and pct(.demanda_1h.atendidas; .demanda_1h.pedidas) < 50)

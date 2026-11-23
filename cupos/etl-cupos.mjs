@@ -146,6 +146,12 @@ const ESTADO_CADA_MS  = Math.max(60_000, Number(process.env.ESTADO_CADA_MS || 10
 const ESTADO_DIR      = String(process.env.ESTADO || '').trim();
 const MEMORIA_ARCHIVO = ESTADO_DIR ? path.join(ESTADO_DIR, 'memoria-claves.json') : '';
 const RITMO_ARCHIVO   = ESTADO_DIR ? path.join(ESTADO_DIR, 'ritmo.json') : '';
+// (2026-11-23) Recintos y universo de claves cambian muy poco: se guardan aquí y se reutilizan
+// UNIVERSO_TTL_MIN (2 h). Antes cada ciclo de cada parte (3 × cada 50 min) los volvía a pedir a la
+// UASD al arrancar, en ráfaga con la carga de la página; el 23-nov la UASD frenó a dos partes justo
+// en ese arranque. La reconciliación por universo solo corre con un universo recién pedido.
+const UNIVERSO_ARCHIVO = ESTADO_DIR ? path.join(ESTADO_DIR, 'universo.json') : '';
+const UNIVERSO_TTL_MS  = Math.max(0, Number(process.env.UNIVERSO_TTL_MIN ?? 120)) * 60_000;
 
 /** Señal para el bucle del workflow (un archivo pequeño en ESTADO). Best-effort. */
 function senal(nombre, valor) {
@@ -158,6 +164,15 @@ function leerJson(archivo) {
 function escribirJson(archivo, valor) {
   if (!archivo) return;
   try { fs.mkdirSync(path.dirname(archivo), { recursive: true }); fs.writeFileSync(archivo, JSON.stringify(valor)); } catch { /* best-effort */ }
+}
+
+/** Universo guardado si es reciente y sano (≥ 100 claves), o null. */
+function leerUniversoGuardado() {
+  const j = leerJson(UNIVERSO_ARCHIVO);
+  if (!j || j.v !== 1 || !Array.isArray(j.claves) || !Array.isArray(j.campus)) return null;
+  const edad = Date.now() - (Number(j.t) || 0);
+  if (!(edad >= 0 && edad < UNIVERSO_TTL_MS) || j.claves.length < 100) return null;
+  return { ...j, edadMin: Math.round(edad / 60_000) };
 }
 
 // Memoria por clave (MAYÚSCULAS): { t: última lectura OK (ms), n: lecturas seguidas sin cambio,
@@ -1519,8 +1534,13 @@ async function main() {
     // solo entra si la directa queda bloqueada.
     let directa = false;
     if (!cd) {
-      directa = await testProxy(null, 25_000);
-      if (directa) console.log('   ✓ La salida directa pasa Cloudflare: sin proxy en este ciclo.');
+      // (2026-11-23) Si esta máquina ya leyó bien en este turno, la salida directa está probada: no
+      // se abre otro navegador NUEVO (sin cookies) contra la UASD en cada ciclo. Era una visita extra
+      // por IP cada 50 min justo antes de cargar la página, donde el 23-nov la UASD frenó a dos partes.
+      // Si la salida dejara de servir, lo detecta la carga de la página y el ciclo siguiente vuelve a probar.
+      directa = lecturasTurno > 0 ? true : await testProxy(null, 25_000);
+      if (directa && lecturasTurno > 0) console.log(`   ✓ Salida directa ya probada en este turno (${lecturasTurno} lecturas buenas): sin prueba extra.`);
+      else if (directa) console.log('   ✓ La salida directa pasa Cloudflare: sin proxy en este ciclo.');
       else if (vetoDirecto && lecturasTurno === 0 && puedeReemplazar) {
         // La UASD veta esta IP desde el primer contacto (no la quemamos nosotros): insistir no
         // sirve y un proxy gratis rara vez pasa. El turno pide otra máquina de GitHub (otra IP).
@@ -1556,12 +1576,22 @@ async function main() {
   console.log('   ✓ Página lista. Título:', await masterPage.title(), '\n');
   startProHunter();
 
+  // (2026-11-23) Recintos y universo guardados hace < 2 h: sin pedirlos otra vez a la UASD.
+  const universoGuardado = leerUniversoGuardado();
+  const universoFresco = !universoGuardado;
+  const claveSet = new Set();
+  let campusRows = [];
+  if (universoGuardado) {
+    campusRows = universoGuardado.campus;
+    universoGuardado.claves.forEach((k) => claveSet.add(String(k).trim()));
+    console.log(`1–2. Recintos y universo guardados hace ${universoGuardado.edadMin} min: ${claveSet.size} claves (sin pedirlos a la UASD en este ciclo).`);
+  } else {
   // ── 1. getCampus ─────────────────────────────────────────────────────────
   console.log('1. getCampus…');
   const campusList = await pageXHR(masterPage, 'getCampus');
   console.log(`   ${campusList.length} campus.`);
 
-  const campusRows = campusList
+  campusRows = campusList
     .filter(c => c.codigo && c.codigo !== '000')
     .map(c => ({ codigo: String(c.codigo).trim(), descripcion: String(c.descripcion ?? '').trim() }));
 
@@ -1571,7 +1601,6 @@ async function main() {
 
   // ── 2. Universo de claves ─────────────────────────────────────────────────
   console.log('2. Universo de claves…');
-  const claveSet = new Set();
 
   try {
     const a = await pageXHR(masterPage, 'getAsignaturas', { campus: '000' });
@@ -1588,6 +1617,9 @@ async function main() {
         if (Array.isArray(a)) a.forEach(k => claveSet.add(String(k).trim()));
       } catch (e) { console.warn(`   ⚠ getAsignaturas(${cod}):`, e.message); }
     }
+  }
+  // Se guarda para los próximos ciclos (solo si vino sano).
+  if (claveSet.size >= 100) escribirJson(UNIVERSO_ARCHIVO, { v: 1, t: Date.now(), campus: campusRows, claves: [...claveSet] });
   }
 
   const universo = [...claveSet].filter(Boolean).sort();
@@ -1633,8 +1665,14 @@ async function main() {
     const cabe = Math.max(0, (minutesLeft() - 1.5) * 60_000);
     const aqui = Math.min(ms, cabe);
     if (aqui > 0) {
-      await hbBeat({ detail: `pausa de ${Math.round(aqui / 1000)} s: ${motivo} · ${resumenRitmo()}` });
-      await sleep(aqui);
+      // (2026-11-23) Late cada 5 min y dice cuándo reanuda: una pausa pedida por la UASD (hasta 1 h)
+      // se ve como «en pausa, vuelve a las HH:MM», no como una parte muerta sin latido.
+      const fin = Date.now() + aqui;
+      const reanuda = new Date(Date.now() + ms).toISOString().slice(11, 16);
+      while (Date.now() < fin) {
+        await hbBeat({ detail: `pausa de ${Math.round(ms / 1000)} s: ${motivo} · reanuda ${reanuda} UTC · ${resumenRitmo()}` });
+        await sleep(Math.min(fin - Date.now(), 5 * 60_000));
+      }
     }
     return ms - aqui;
   }
@@ -1841,6 +1879,8 @@ async function main() {
   async function reconcileUniverse() {
     if (universoReconciliado) return;
     universoReconciliado = true;
+    // Con el universo guardado (≤ 2 h) no se cierra nada: solo con uno recién pedido a la UASD.
+    if (!universoFresco) return;
     try {
       const universeUpper = new Set(universo.map(c => c.toUpperCase()));
       if (universo.length >= Math.max(500, state.size * 0.8)) {

@@ -19,6 +19,14 @@ Las vigiladas por el agente van a 6 min y al frente solo si están apretadas. Ca
 vuelve a elegir por atraso. Una materia que la UASD responde sin secciones se da por leída (6–12 h). Mismo
 ritmo de consultas a la UASD: solo se reparte mejor (`claseRelectura` en `ritmo.mjs`).
 
+**Freno del 23-nov-2026 (20:47–21:50 UTC, primera tarde de selección)**: la UASD respondió 429 con
+`Retry-After` de ~48 min a las tres IP; el sistema esperó y reanudó solo. Dos de los frenos cayeron al ARRANCAR
+un ciclo y el tercero fue una prueba propia del escalón 4 al caducar su veto de 24 h (castigado también el 21 y
+el 22). Desde entonces: el veto de un escalón reincidente sigue doblándose hasta 7 días (no se re-prueba cada
+día), un ciclo de una máquina que ya leyó bien no abre otro navegador nuevo contra la UASD, recintos y universo
+de claves se reutilizan 2 h (`universo.json`), la pausa late cada 5 min con su hora de reanudación y el doctor
+la informa como «pausa» (grave solo si pasa de 2 h sin escribir). Nunca se rota IP para esquivar un 429.
+
 **Lección del 16 al 21-nov-2026**: con ~900.000 lecturas al día la UASD empezó a frenar `getData` y a
 vetar algunas IP («403 Prohibido por el servidor»). El ETL reintentaba en ráfaga y un turno vetado se
 relanzaba cada 35 s. Ahora la UASD marca el ritmo, lo que no cambia se relee cada vez menos, un ciclo

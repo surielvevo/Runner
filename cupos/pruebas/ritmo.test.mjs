@@ -169,7 +169,7 @@ test('el umbral aprendido viaja entre ciclos y caduca solo', () => {
   assert.equal(caducado.umbral, null);
 });
 
-test('umbral reincidente: castigado al caducar el veto, el siguiente dura el doble (tope 24 h)', () => {
+test('umbral reincidente: castigado al caducar el veto, el siguiente dura el doble (tope 7 días)', () => {
   const H = 3_600_000;
   const t0 = 1_000_000_000_000;
   // Caso real del 22-nov: umbral 5 (6 h) caduca, sube al 4 tras 3 lotes limpios y la UASD castiga 1 h.
@@ -185,14 +185,31 @@ test('umbral reincidente: castigado al caducar el veto, el siguiente dura el dob
   assert.equal(a.ritmo.umbralHoras, 12);
   assert.equal(a.ritmo.umbralHasta, t1 + 60_000 + 12 * H);
   assert.equal(a.pausaMs, H);
-  // Otra reincidencia: 24 h; y no pasa de 24.
-  const t2 = a.ritmo.umbralHasta + 60_000;
-  r = { ...a.ritmo, nivel: 4, malos: 0 };
-  a = ajustarRitmo(r, lote(5, 2, 3, 0, 3600), { ahora: t2 });
-  assert.equal(a.ritmo.umbralHoras, 24);
-  const t3 = a.ritmo.umbralHasta + 60_000;
-  a = ajustarRitmo({ ...a.ritmo, nivel: 4, malos: 0 }, lote(5, 2, 3, 0, 3600), { ahora: t3 });
-  assert.equal(a.ritmo.umbralHoras, 24);
+  // (2026-11-23) Cada reincidencia sigue doblando: 24, 48, 96 y 168 h (7 días), y no pasa de ahí.
+  const esperadas = [24, 48, 96, 168, 168];
+  for (const horas of esperadas) {
+    const t = a.ritmo.umbralHasta + 60_000;
+    a = ajustarRitmo({ ...a.ritmo, nivel: 4, malos: 0 }, lote(5, 2, 3, 0, 3600), { ahora: t });
+    assert.equal(a.ritmo.umbral, 5);
+    assert.equal(a.ritmo.umbralHoras, horas);
+    assert.equal(a.ritmo.umbralHasta, t + horas * H);
+  }
+});
+
+test('umbral: caso real del 23-nov, el veto de 24 h caduca, la prueba sale castigada y el siguiente dura 48 h', () => {
+  const H = 3_600_000;
+  const t0 = 1_000_000_000_000;
+  // Parte 1 a las 20:56 UTC: «umbral 5 hasta 20:56 UTC (24 h, reincidió)» acaba de caducar.
+  let r = ritmoInicial({ nivel: 5, t: t0 - 60_000, umbral: 5, umbralHasta: t0 - 1, umbralHoras: 24 }, { ahora: t0 });
+  assert.equal(r.umbral, null);
+  assert.equal(r.previo.horas, 24);
+  for (let i = 0; i < 3; i++) r = ajustarRitmo(r, lote(4, 4), { ahora: t0 + i * 60_000 }).ritmo;
+  assert.equal(r.nivel, 4);                        // prueba el escalón vedado…
+  const a = ajustarRitmo(r, lote(4, 1, 3, 0, 2861), { ahora: t0 + 5 * 60_000 });
+  assert.equal(a.ritmo.nivel, 5);                  // …la UASD castiga (429 + Retry-After 2861 s)
+  assert.equal(a.ritmo.umbral, 5);
+  assert.equal(a.ritmo.umbralHoras, 48);           // antes se quedaba en 24 h y se repetía cada día
+  assert.equal(a.pausaMs, 2861 * 1000);
 });
 
 test('umbral: si el veto caducó hace más de 3 h, o el castigo es en un escalón más lento, vuelve a 6 h', () => {

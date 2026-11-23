@@ -42,7 +42,10 @@ const CASTIGO_LARGO_MS = 10 * 60_000;
 // (2026-11-22) Medido: al caducar el veto, las 3 partes probaron a la vez el escalón vedado y la UASD
 // las castigó juntas 1 h (sin lecturas de 02:52 a 03:52 UTC). Si el castigo llega poco después de que
 // caducara el veto de ese mismo escalón, el veto siguiente dura el doble: 6 → 12 → 24 h.
-const UMBRAL_MAX_HORAS = 24;
+// (2026-11-23) Tope de 24 h a 7 días: la UASD castigó el escalón 4 el 21, el 22 y el 23-nov, y con el
+// tope en 24 h cada parte lo volvía a probar una vez al día y perdía ~1 h de lecturas (el 23-nov a las
+// 20:57 UTC, en plena selección). Ahora sigue doblándose: 24 → 48 → 96 → 168 h.
+const UMBRAL_MAX_HORAS = 7 * 24;
 const REINCIDE_MS = 3 * 3_600_000;
 
 const entero = (v, d) => (Number.isInteger(v) ? v : d);
@@ -82,7 +85,7 @@ export function ritmoInicial(guardado, { tope = 1, arranque = 4, ahora = Date.no
  *    todo vino frenado) y pausa 30 s, 60 s, 120 s… (máx. 10 min; respeta Retry-After, hasta 1 h).
  *    Si el castigo es largo (Retry-After ≥ 10 min) o se repite, el escalón que lo provocó queda
  *    vedado 6 h (umbral): no se vuelve a subir hasta él. Si lo castigan otra vez nada más
- *    caducar su veto, el nuevo dura el doble (12 h, 24 h). `desfaseMs` (uno por parte) evita
+ *    caducar su veto, el nuevo dura el doble (12 h, 24 h… hasta 7 días). `desfaseMs` (uno por parte) evita
  *    que las tres partes vuelvan a probar a la vez.
  *  · Lote limpio: tras 3 seguidos sube 1 escalón, nunca por encima del tope ni del umbral.
  *  · Algo de ruido sin freno: se mantiene.
