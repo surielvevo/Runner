@@ -227,3 +227,22 @@ jobs:
             fi
             echo "::warning::Aviso #$n sigue abierto."
           fi
+
+      - name: Mantener vivos los horarios (GitHub los apaga tras 60 días sin cambios)
+        # (2026-11-24) En un repositorio público GitHub suspende los horarios tras 60 días sin actividad: el
+        # lector de la UASD y este doctor se quedarían quietos en silencio. Una vez al día (hora 12 UTC) se
+        # vuelven a habilitar los dos con el token propio del workflow (`actions: write`, ya concedido: sin
+        # claves ni permisos nuevos). Va al final y nunca frena al doctor.
+        if: always() && github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$(date -u +%H)" = "12" ] || { echo "Fuera de la hora de mantenimiento (12 UTC)."; exit 0; }
+          for w in cupos-uasd.yml doctor-cupos.yml; do
+            if gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$w/enable" >/dev/null; then
+              echo "Horario de $w renovado."
+            else
+              echo "::warning::No se pudo renovar el horario de $w; se reintenta mañana."
+            fi
+          done
